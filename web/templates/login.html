@@ -1,0 +1,43 @@
+{{define "content"}}
+<div class="auth-shell">
+  <div class="card auth-card">
+    <div class="auth-brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 18.5h11a4 4 0 0 0 .6-7.95A6 6 0 0 0 6.6 9.2a4.7 4.7 0 0 0-.1 9.3z"/><path d="M12 11.5v5"/><path d="m9.8 14.3 2.2-2.2 2.2 2.2"/></svg>
+      </span>
+      <div>
+        <div class="brand-name">{{ .SiteName }}</div>
+        <div class="small faint">Google Drive over S3</div>
+      </div>
+    </div>
+
+    <h1>{{ t "login.title" }}</h1>
+    <p class="sub">{{ t "login.subtitle" }}</p>
+
+    {{if .Error}}
+    <div class="flash error">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
+      <div>{{ .Error }}</div>
+    </div>
+    {{end}}
+
+    <form method="post" action="/login" class="form">
+      <input type="hidden" name="csrf" value="{{ .CSRF }}">
+      <input type="hidden" name="next" value="{{ .Next }}">
+      <div class="field">
+        <label for="password">{{ t "login.password" }}</label>
+        <input class="input" id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+      </div>
+      <button class="btn btn-primary" type="submit">{{ t "login.signin" }}</button>
+    </form>
+
+    <div class="row-between mt-3">
+      <span class="small faint">v{{ .Version }}</span>
+      <div class="lang-toggle">
+        <form method="post" action="/lang"><input type="hidden" name="csrf" value="{{ .CSRF }}"><input type="hidden" name="lang" value="en"><button type="submit" class="{{if eq .Lang "en"}}on{{end}}">EN</button></form>
+        <form method="post" action="/lang"><input type="hidden" name="csrf" value="{{ .CSRF }}"><input type="hidden" name="lang" value="tr"><button type="submit" class="{{if eq .Lang "tr"}}on{{end}}">TR</button></form>
+      </div>
+    </div>
+  </div>
+</div>
+{{end}}

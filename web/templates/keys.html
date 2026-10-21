@@ -1,0 +1,102 @@
+{{define "content"}}
+<div class="stack">
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "keys.endpoint_title" }}</h2><p>{{ t "keys.endpoint_hint" }}</p></div>
+      <span class="badge accent">S3</span>
+    </div>
+    <div class="card-body stack">
+      <div class="row wrap">
+        <span class="code grow">{{ .Endpoint }}</span>
+        <button class="icon-btn" type="button" data-copy="{{ .Endpoint }}" data-copied-label="{{ t "common.copied" }}" title="{{ t "common.copy" }}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+        </button>
+        <span class="badge">{{ t "keys.region" }}: {{ .Region }}</span>
+      </div>
+      <div class="snippet">{{ .Example }}<button class="icon-btn" type="button" data-copy="{{ .Example }}" data-copied-label="{{ t "common.copied" }}" title="{{ t "common.copy" }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button></div>
+      <p class="small faint" style="margin:0">{{ t "keys.endpoint_note" }}</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "keys.create_title" }}</h2><p>{{ t "keys.create_hint" }}</p></div>
+    </div>
+    <div class="card-body">
+      <form method="post" action="/keys/create" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ .CSRF }}">
+        <div class="field grow" style="max-width:340px">
+          <label for="key-label">{{ t "keys.label" }}</label>
+          <input class="input" id="key-label" name="label" placeholder="{{ t "keys.label_placeholder" }}" autocomplete="off">
+        </div>
+        <button class="btn btn-primary" type="submit">{{ t "keys.create" }}</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "keys.title" }}</h2><p>{{ t "keys.subtitle" }}</p></div>
+      <span class="badge">{{ len .Keys }} {{ t "keys.count" }}</span>
+    </div>
+    {{if .Keys}}
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>{{ t "keys.access_key" }}</th>
+            <th class="hide-sm">{{ t "keys.label" }}</th>
+            <th>{{ t "common.status" }}</th>
+            <th class="hide-sm">{{ t "keys.created" }}</th>
+            <th class="hide-sm">{{ t "keys.last_used" }}</th>
+            <th class="actions"><span class="sr-only">{{ t "files.actions" }}</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Keys}}
+          <tr>
+            <td>
+              <div class="cell-name">
+                <span class="type-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="3.5"/><path d="m10 13 8.5-8.5"/></svg></span>
+                <span class="mono truncate">{{ .AccessKey }}</span>
+                <button class="icon-btn" type="button" data-copy="{{ .AccessKey }}" data-copied-label="{{ t "common.copied" }}" title="{{ t "common.copy" }}" style="width:26px;height:26px">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+                </button>
+              </div>
+            </td>
+            <td class="hide-sm">{{ if .Label }}{{ .Label }}{{ else }}<span class="faint">—</span>{{ end }}</td>
+            <td>{{ if .Active }}<span class="badge ok">{{ t "keys.active" }}</span>{{ else }}<span class="badge danger">{{ t "keys.disabled" }}</span>{{ end }}</td>
+            <td class="hide-sm muted small nowrap">{{ .Created }}</td>
+            <td class="hide-sm muted small nowrap">{{ if .LastUsed }}{{ .LastUsed }}{{ else }}{{ t "keys.never" }}{{ end }}</td>
+            <td class="actions">
+              <form method="post" action="/keys/toggle" style="display:inline">
+                <input type="hidden" name="csrf" value="{{ $.CSRF }}">
+                <input type="hidden" name="access_key" value="{{ .AccessKey }}">
+                <input type="hidden" name="active" value="{{ if .Active }}0{{else}}1{{end}}">
+                <button class="btn btn-sm" type="submit">{{ if .Active }}{{ t "keys.disable" }}{{ else }}{{ t "keys.enable" }}{{ end }}</button>
+              </form>
+              <form method="post" action="/keys/delete" style="display:inline" onsubmit="return confirm('{{ t "keys.delete_confirm" }}')">
+                <input type="hidden" name="csrf" value="{{ $.CSRF }}">
+                <input type="hidden" name="access_key" value="{{ .AccessKey }}">
+                <button class="icon-btn" type="submit" title="{{ t "common.delete" }}">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6.5 7l.8 12h9.4l.8-12"/></svg>
+                </button>
+              </form>
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    {{else}}
+    <div class="empty">
+      <div class="empty-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="3.5"/><path d="m10 13 8.5-8.5"/></svg>
+      </div>
+      <h3>{{ t "keys.empty" }}</h3>
+      <p>{{ t "keys.empty_hint" }}</p>
+    </div>
+    {{end}}
+  </div>
+</div>
+{{end}}

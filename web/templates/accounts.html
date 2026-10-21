@@ -1,0 +1,67 @@
+{{define "content"}}
+{{if not .OAuthReady}}
+<div class="flash warn">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2.7 20h18.6z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+  <div class="grow">{{ t "accounts.oauth_missing" }} <a href="/settings">{{ t "setup.open_settings" }}</a></div>
+</div>
+{{end}}
+
+<div class="row-between mb-2">
+  <p class="muted small" style="margin:0;max-width:640px">{{ t "accounts.subtitle" }}</p>
+  {{if .OAuthReady}}<a class="btn btn-primary" href="/oauth/start">{{ t "accounts.connect" }}</a>{{end}}
+</div>
+
+{{if .Accounts}}
+<div class="grid grid-2">
+  {{range .Accounts}}
+  <div class="card account-card">
+    <div class="account-head">
+      <span class="avatar">{{if .Picture}}<img src="{{ .Picture }}" alt="">{{else}}{{ initial .Name }}{{end}}</span>
+      <div class="grow" style="min-width:0">
+        <div class="account-name truncate">{{ .Name }}</div>
+        <div class="account-mail truncate">{{ .Email }}</div>
+      </div>
+      {{if .NeedsReauth}}<span class="badge danger">{{ t "accounts.needs_reauth" }}</span>{{else}}<span class="badge ok"><span class="dot"></span>{{ t "accounts.connected" }}</span>{{end}}
+    </div>
+
+    {{if .QuotaErr}}
+      <div class="flash warn" style="margin:0"><div>{{ .QuotaErr }}</div></div>
+    {{else}}
+    <div>
+      <div class="quota-line">
+        <span>{{ t "accounts.used" }}</span>
+        <span>{{ bytes .Used }}{{if .Limit}} / {{ bytes .Limit }}{{else}} / ∞{{end}}</span>
+      </div>
+      <div class="progress {{ .Class }}"><span style="width: {{ .Pct }}%"></span></div>
+      <div class="row-between mt-1">
+        <span class="small faint">{{ .BucketCount }} {{ t "buckets.count" }}</span>
+        <span class="small faint">{{ .Pct }}%</span>
+      </div>
+    </div>
+    {{end}}
+
+    <div class="row wrap">
+      <a class="btn btn-sm" href="/oauth/start?account={{ urlquery .ID }}">{{ t "accounts.reauth" }}</a>
+      <form method="post" action="/accounts/delete" onsubmit="return confirm('{{ t "accounts.remove_confirm" }}')">
+        <input type="hidden" name="csrf" value="{{ $.CSRF }}">
+        <input type="hidden" name="id" value="{{ .ID }}">
+        <button class="btn btn-sm btn-danger" type="submit">{{ t "accounts.remove" }}</button>
+      </form>
+      <span class="small faint grow" style="text-align:right">{{ t "accounts.added" }} {{ .Created }}</span>
+    </div>
+  </div>
+  {{end}}
+</div>
+{{else}}
+<div class="card">
+  <div class="empty">
+    <div class="empty-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.6"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></svg>
+    </div>
+    <h3>{{ t "accounts.empty" }}</h3>
+    <p>{{ t "accounts.empty_hint" }}</p>
+    {{if .OAuthReady}}<a class="btn btn-primary" href="/oauth/start">{{ t "accounts.connect" }}</a>{{end}}
+  </div>
+</div>
+{{end}}
+{{end}}

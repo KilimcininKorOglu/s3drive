@@ -1,0 +1,100 @@
+{{define "content"}}
+<div class="stack">
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "buckets.create_title" }}</h2><p>{{ t "buckets.create_hint" }}</p></div>
+    </div>
+    <div class="card-body">
+      {{if .Accounts}}
+      <form method="post" action="/buckets/create" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ .CSRF }}">
+        <div class="field grow" style="max-width:320px">
+          <label for="bucket-name">{{ t "buckets.name" }}</label>
+          <input class="input" id="bucket-name" name="name" placeholder="my-bucket" pattern="[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]" autocomplete="off" required>
+          <span class="hint">{{ t "buckets.name_hint" }}</span>
+        </div>
+        <div class="field" style="min-width:200px">
+          <label for="bucket-account">{{ t "buckets.account" }}</label>
+          <select class="select" id="bucket-account" name="account">
+            <option value="">{{ t "buckets.auto_account" }}</option>
+            {{range .Accounts}}<option value="{{ .ID }}">{{ .Email }}{{if .NeedsReauth}} · {{ t "accounts.needs_reauth" }}{{end}}</option>{{end}}
+          </select>
+        </div>
+        <button class="btn btn-primary" type="submit">{{ t "common.create" }}</button>
+      </form>
+      {{else}}
+      <div class="row-between wrap">
+        <span class="muted">{{ t "buckets.need_account" }}</span>
+        <a class="btn btn-primary" href="/accounts">{{ t "accounts.connect" }}</a>
+      </div>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "buckets.title" }}</h2><p>{{ t "buckets.subtitle" }}</p></div>
+      <span class="badge">{{ len .Buckets }} {{ t "buckets.count" }}</span>
+    </div>
+    {{if .Buckets}}
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>{{ t "buckets.name" }}</th>
+            <th class="hide-sm">{{ t "buckets.account" }}</th>
+            <th class="hide-sm">{{ t "buckets.access" }}</th>
+            <th class="hide-sm">{{ t "buckets.created" }}</th>
+            <th class="actions"><span class="sr-only">{{ t "files.actions" }}</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Buckets}}
+          <tr>
+            <td>
+              <div class="cell-name">
+                <span class="type-icon folder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6"/></svg></span>
+                <a class="name" href="/files?bucket={{ urlquery .Name }}">{{ .Name }}</a>
+                {{if .Pool}}<span class="badge accent">{{ t "buckets.pool" }}</span>{{end}}
+              </div>
+            </td>
+            <td class="hide-sm muted small">{{ if .Pool }}{{ t "buckets.pool_account" }}{{ else }}{{ .AccountEmail }}{{ end }}</td>
+            <td class="hide-sm">
+              {{if .Pool}}<span class="badge">{{ t "buckets.pool_access" }}</span>{{else if .PublicRead}}<span class="badge ok">{{ t "buckets.public" }}</span>{{else}}<span class="badge">{{ t "buckets.private" }}</span>{{end}}
+            </td>
+            <td class="hide-sm muted small nowrap">{{ if .Pool }}—{{ else }}{{ .Created }}{{ end }}</td>
+            <td class="actions">
+              <a class="btn btn-sm" href="/files?bucket={{ urlquery .Name }}">{{ t "common.open" }}</a>
+              {{if not .Pool}}
+              <form method="post" action="/buckets/public" style="display:inline">
+                <input type="hidden" name="csrf" value="{{ $.CSRF }}">
+                <input type="hidden" name="name" value="{{ .Name }}">
+                <input type="hidden" name="public" value="{{ if .PublicRead }}0{{else}}1{{end}}">
+                <button class="btn btn-sm" type="submit" title="{{ t "buckets.toggle_public" }}">{{ if .PublicRead }}{{ t "buckets.make_private" }}{{else}}{{ t "buckets.make_public" }}{{end}}</button>
+              </form>
+              <form method="post" action="/buckets/delete" style="display:inline" onsubmit="return confirm('{{ t "buckets.delete_confirm" }}')">
+                <input type="hidden" name="csrf" value="{{ $.CSRF }}">
+                <input type="hidden" name="name" value="{{ .Name }}">
+                <button class="icon-btn" type="submit" title="{{ t "common.delete" }}">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6.5 7l.8 12h9.4l.8-12"/></svg>
+                </button>
+              </form>
+              {{end}}
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    {{else}}
+    <div class="empty">
+      <div class="empty-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6"/></svg>
+      </div>
+      <h3>{{ t "buckets.empty" }}</h3>
+      <p>{{ t "buckets.empty_hint" }}</p>
+    </div>
+    {{end}}
+  </div>
+</div>
+{{end}}

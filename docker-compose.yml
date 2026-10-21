@@ -1,0 +1,22 @@
+name: s3drive
+
+services:
+  s3drive:
+    build: .
+    image: s3drive:latest
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "8080:8080"
+    environment:
+      S3DRIVE_PUBLIC_URL: ${S3DRIVE_PUBLIC_URL:-http://localhost:8080}
+      S3DRIVE_PUBLIC_S3_URL: ${S3DRIVE_PUBLIC_S3_URL:-}
+      S3DRIVE_UI_PASSWORD: ${S3DRIVE_UI_PASSWORD:?set S3DRIVE_UI_PASSWORD in .env}
+      S3DRIVE_MASTER_KEY: ${S3DRIVE_MASTER_KEY:-}
+      S3DRIVE_TRUST_PROXY: ${S3DRIVE_TRUST_PROXY:-false}
+      S3DRIVE_LOG_LEVEL: ${S3DRIVE_LOG_LEVEL:-info}
+    volumes:
+      - s3drive-data:/data
+
+volumes:
+  s3drive-data:

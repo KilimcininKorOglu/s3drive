@@ -1,0 +1,120 @@
+{{define "content"}}
+<div class="stack">
+  {{if not .OAuthReady}}
+  <div class="flash warn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2.7 20h18.6z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+    <div class="grow">{{ t "settings.oauth_warning" }}</div>
+  </div>
+  {{end}}
+
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "settings.oauth_title" }}</h2><p>{{ t "settings.oauth_hint" }}</p></div>
+      {{if .OAuthReady}}<span class="badge ok"><span class="dot"></span>{{ t "settings.oauth_ready" }}</span>{{else}}<span class="badge warn">{{ t "settings.oauth_missing" }}</span>{{end}}
+    </div>
+    <div class="card-body">
+      <form method="post" action="/settings/oauth" class="form">
+        <input type="hidden" name="csrf" value="{{ .CSRF }}">
+        <div class="field">
+          <label for="client-id">{{ t "settings.client_id" }}</label>
+          <input class="input" id="client-id" name="client_id" value="{{ .OAuthClientID }}" placeholder="1234567890-xxxxxxxx.apps.googleusercontent.com" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="client-secret">{{ t "settings.client_secret" }}</label>
+          <input class="input" id="client-secret" name="client_secret" type="password" placeholder="{{ if .OAuthSecretSet }}{{ t "settings.secret_keep" }}{{ else }}GOCSPX-…{{ end }}" autocomplete="new-password">
+          <span class="hint">{{ t "settings.secret_hint" }}</span>
+        </div>
+        <div class="field">
+          <label>{{ t "settings.redirect_uri" }}</label>
+          <div class="row">
+            <span class="code grow">{{ .RedirectURI }}</span>
+            <button class="icon-btn" type="button" data-copy="{{ .RedirectURI }}" data-copied-label="{{ t "common.copied" }}" title="{{ t "common.copy" }}">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+            </button>
+          </div>
+          <span class="hint">{{ t "settings.redirect_hint" }}</span>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" type="submit">{{ t "common.save" }}</button>
+          <a class="btn btn-ghost" href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">{{ t "settings.open_console" }}</a>
+        </div>
+      </form>
+
+      <details class="help mt-2">
+        <summary>{{ t "settings.howto_title" }}</summary>
+        <div class="help-body">
+          <ol style="margin:0;padding-left:18px">
+            <li>{{ t "settings.howto_1" }}</li>
+            <li>{{ t "settings.howto_2" }}</li>
+            <li>{{ t "settings.howto_3" }}</li>
+            <li>{{ t "settings.howto_4" }}</li>
+            <li>{{ t "settings.howto_5" }}</li>
+          </ol>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "settings.server_title" }}</h2><p>{{ t "settings.server_hint" }}</p></div>
+    </div>
+    <div class="card-body">
+      <form method="post" action="/settings/server" class="form">
+        <input type="hidden" name="csrf" value="{{ .CSRF }}">
+        <div class="grid grid-2">
+          <div class="field">
+            <label for="public-url">{{ t "settings.public_url" }}</label>
+            <input class="input" id="public-url" name="public_url" value="{{ .PublicURL }}" placeholder="https://s3drive.example.com" autocomplete="off">
+            <span class="hint">{{ t "settings.public_url_hint" }}</span>
+          </div>
+          <div class="field">
+            <label for="site-name">{{ t "settings.site_name" }}</label>
+            <input class="input" id="site-name" name="site_name" value="{{ .SiteName }}" placeholder="s3drive" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="region">{{ t "settings.region" }}</label>
+            <input class="input" id="region" name="region" value="{{ .Region }}" placeholder="us-east-1" autocomplete="off">
+            <span class="hint">{{ t "settings.region_hint" }}</span>
+          </div>
+          <div class="field">
+            <label for="cors">{{ t "settings.cors" }}</label>
+            <input class="input" id="cors" name="cors_origins" value="{{ .CORS }}" placeholder="*" autocomplete="off">
+            <span class="hint">{{ t "settings.cors_hint" }}</span>
+          </div>
+          <div class="field">
+            <label for="pool-name">{{ t "settings.pool_name" }}</label>
+            <input class="input" id="pool-name" name="pool_name" value="{{ .PoolName }}" placeholder="pool" autocomplete="off">
+            <span class="hint">{{ t "settings.pool_hint" }}</span>
+          </div>
+          <div class="field" style="justify-content:flex-end">
+            <label class="check">
+              <input type="checkbox" name="pool_enabled" value="1" {{if .PoolEnabled}}checked{{end}}>
+              {{ t "settings.pool_enabled" }}
+            </label>
+            <span class="hint">{{ t "settings.pool_enabled_hint" }}</span>
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" type="submit">{{ t "common.save" }}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><div><h2>{{ t "settings.env_title" }}</h2><p>{{ t "settings.env_hint" }}</p></div></div>
+    <div class="card-body">
+      <table class="table">
+        <tbody>
+          <tr><td class="mono">S3DRIVE_UI_PASSWORD</td><td class="muted small">{{ t "settings.env_password" }}</td></tr>
+          <tr><td class="mono">S3DRIVE_MASTER_KEY</td><td class="muted small">{{ t "settings.env_master" }}</td></tr>
+          <tr><td class="mono">S3DRIVE_DATA_DIR</td><td class="muted small">{{ t "settings.env_data" }}</td></tr>
+          <tr><td class="mono">S3DRIVE_S3_ADDR</td><td class="muted small">{{ t "settings.env_s3" }}</td></tr>
+          <tr><td class="mono">S3DRIVE_UI_ADDR</td><td class="muted small">{{ t "settings.env_ui" }}</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{{end}}

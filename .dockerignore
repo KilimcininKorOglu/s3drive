@@ -1,0 +1,13 @@
+# Version control and local data
+.git
+.gitignore
+.DS_Store
+data/
+bin/
+*.db
+*.log
+.env
+.env.*
+
+# Reference projects are not part of the image build context.
+helper-projects/

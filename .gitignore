@@ -1,0 +1,21 @@
+# Build output
+/bin/
+/dist/
+
+# Runtime data: database, master key, spool, logs
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
