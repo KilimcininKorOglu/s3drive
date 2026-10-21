@@ -130,20 +130,20 @@ Bucket names must be 3–63 characters, lowercase letters/numbers/dots/hyphens, 
 
 ### Configuration
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `S3DRIVE_DATA_DIR` | `./data` | SQLite DB, master key, spool |
-| `S3DRIVE_S3_ADDR` | `:9000` | S3 listener |
-| `S3DRIVE_UI_ADDR` | `:8080` | Console listener |
-| `S3DRIVE_PUBLIC_URL` | `http://localhost:8080` | Public console URL, used in OAuth redirects |
-| `S3DRIVE_PUBLIC_S3_URL` | empty | Public S3 URL shown in the console |
-| `S3DRIVE_MASTER_KEY` | generated `data/master.key` | 32-byte base64/hex key for secret encryption |
-| `S3DRIVE_UI_PASSWORD` | empty | Console password; if empty the console is open |
-| `S3DRIVE_SPOOL_DIR` | `$DATA_DIR/tmp` | Multipart/staging directory |
-| `S3DRIVE_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
-| `S3DRIVE_TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto` for secure cookies/URLs |
-| `S3DRIVE_GOOGLE_CLIENT_ID` | empty | Optional OAuth client override (env wins) |
-| `S3DRIVE_GOOGLE_CLIENT_SECRET` | empty | Optional OAuth secret override |
+| Variable                       | Default                     | Purpose                                           |
+|--------------------------------|-----------------------------|---------------------------------------------------|
+| `S3DRIVE_DATA_DIR`             | `./data`                    | SQLite DB, master key, spool                      |
+| `S3DRIVE_S3_ADDR`              | `:9000`                     | S3 listener                                       |
+| `S3DRIVE_UI_ADDR`              | `:8080`                     | Console listener                                  |
+| `S3DRIVE_PUBLIC_URL`           | `http://localhost:8080`     | Public console URL, used in OAuth redirects       |
+| `S3DRIVE_PUBLIC_S3_URL`        | empty                       | Public S3 URL shown in the console                |
+| `S3DRIVE_MASTER_KEY`           | generated `data/master.key` | 32-byte base64/hex key for secret encryption      |
+| `S3DRIVE_UI_PASSWORD`          | empty                       | Console password; if empty the console is open    |
+| `S3DRIVE_SPOOL_DIR`            | `$DATA_DIR/tmp`             | Multipart/staging directory                       |
+| `S3DRIVE_LOG_LEVEL`            | `info`                      | `debug`, `info`, `warn`, `error`                  |
+| `S3DRIVE_TRUST_PROXY`          | `false`                     | Trust `X-Forwarded-Proto` for secure cookies/URLs |
+| `S3DRIVE_GOOGLE_CLIENT_ID`     | empty                       | Optional OAuth client override (env wins)         |
+| `S3DRIVE_GOOGLE_CLIENT_SECRET` | empty                       | Optional OAuth secret override                    |
 
 Runtime settings that can be changed in the console: OAuth client, public URL, region label, pool name/enabled, CORS origins, site name.
 
@@ -353,20 +353,20 @@ Bucket adları 3–63 karakter olmalı; küçük harf, rakam, nokta ve tire içe
 
 ### Yapılandırma
 
-| Değişken | Varsayılan | Amaç |
-| --- | --- | --- |
-| `S3DRIVE_DATA_DIR` | `./data` | SQLite DB, master key, geçici dosyalar |
-| `S3DRIVE_S3_ADDR` | `:9000` | S3 dinleyicisi |
-| `S3DRIVE_UI_ADDR` | `:8080` | Konsol dinleyicisi |
-| `S3DRIVE_PUBLIC_URL` | `http://localhost:8080` | Genel konsol URL'i, OAuth yönlendirmesinde kullanılır |
-| `S3DRIVE_PUBLIC_S3_URL` | boş | Konsolda gösterilen genel S3 URL'i |
-| `S3DRIVE_MASTER_KEY` | üretilen `data/master.key` | Sır şifreleme için 32 baytlık base64/hex anahtar |
-| `S3DRIVE_UI_PASSWORD` | boş | Konsol şifresi; boşsa konsol açıktır |
-| `S3DRIVE_SPOOL_DIR` | `$DATA_DIR/tmp` | Multipart/geçici dosya dizini |
-| `S3DRIVE_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
-| `S3DRIVE_TRUST_PROXY` | `false` | Güvenli çerez/URL için `X-Forwarded-Proto`'ya güven |
-| `S3DRIVE_GOOGLE_CLIENT_ID` | boş | İsteğe bağlı OAuth client override (env önceliklidir) |
-| `S3DRIVE_GOOGLE_CLIENT_SECRET` | boş | İsteğe bağlı OAuth secret override |
+| Değişken                       | Varsayılan                 | Amaç                                                  |
+|--------------------------------|----------------------------|-------------------------------------------------------|
+| `S3DRIVE_DATA_DIR`             | `./data`                   | SQLite DB, master key, geçici dosyalar                |
+| `S3DRIVE_S3_ADDR`              | `:9000`                    | S3 dinleyicisi                                        |
+| `S3DRIVE_UI_ADDR`              | `:8080`                    | Konsol dinleyicisi                                    |
+| `S3DRIVE_PUBLIC_URL`           | `http://localhost:8080`    | Genel konsol URL'i, OAuth yönlendirmesinde kullanılır |
+| `S3DRIVE_PUBLIC_S3_URL`        | boş                        | Konsolda gösterilen genel S3 URL'i                    |
+| `S3DRIVE_MASTER_KEY`           | üretilen `data/master.key` | Sır şifreleme için 32 baytlık base64/hex anahtar      |
+| `S3DRIVE_UI_PASSWORD`          | boş                        | Konsol şifresi; boşsa konsol açıktır                  |
+| `S3DRIVE_SPOOL_DIR`            | `$DATA_DIR/tmp`            | Multipart/geçici dosya dizini                         |
+| `S3DRIVE_LOG_LEVEL`            | `info`                     | `debug`, `info`, `warn`, `error`                      |
+| `S3DRIVE_TRUST_PROXY`          | `false`                    | Güvenli çerez/URL için `X-Forwarded-Proto`'ya güven   |
+| `S3DRIVE_GOOGLE_CLIENT_ID`     | boş                        | İsteğe bağlı OAuth client override (env önceliklidir) |
+| `S3DRIVE_GOOGLE_CLIENT_SECRET` | boş                        | İsteğe bağlı OAuth secret override                    |
 
 Konsoldan değiştirilebilen çalışma zamanı ayarları: OAuth istemcisi, genel URL, region etiketi, pool adı/etkinliği, CORS kaynakları, site adı.
 
