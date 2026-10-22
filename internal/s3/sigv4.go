@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,6 +36,7 @@ func authErr(code, format string, args ...any) *AuthError {
 // Auth is the verified request signature.
 type Auth struct {
 	AccessKey   string
+	Key         *store.AccessKey
 	PayloadHash string
 	Signature   string
 	SigningKey  []byte
@@ -99,16 +101,23 @@ func (a *Authenticator) verifyHeader(r *http.Request, now time.Time) (*Auth, *Au
 	if d := now.Sub(t); d > 15*time.Minute || d < -15*time.Minute {
 		return nil, authErr("RequestTimeTooSkewed", "request time is too far from server time")
 	}
+	if date != datetime[:8] {
+		return nil, authErr("InvalidRequest", "credential date does not match x-amz-date")
+	}
 
 	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
 	if payloadHash == "" {
 		payloadHash = "UNSIGNED-PAYLOAD"
 	}
 
-	secret, active, err := a.Store.GetAccessKeySecret(r.Context(), accessKey)
-	if err != nil || !active {
+	keyRow, err := a.Store.GetAccessKey(r.Context(), accessKey)
+	if err != nil || !keyRow.Active {
 		return nil, authErr("InvalidAccessKeyId", "the access key does not exist or is disabled")
 	}
+	if !keyRow.ExpiresAt.IsZero() && !now.Before(keyRow.ExpiresAt) {
+		return nil, authErr("AccessDenied", "this access key has expired")
+	}
+	secret := keyRow.Secret
 
 	canonical, aerr := canonicalRequest(r, signedHeaders, payloadHash)
 	if aerr != nil {
@@ -123,7 +132,7 @@ func (a *Authenticator) verifyHeader(r *http.Request, now time.Time) (*Auth, *Au
 	}
 	a.Store.TouchAccessKey(r.Context(), accessKey)
 	return &Auth{
-		AccessKey: accessKey, PayloadHash: payloadHash, Signature: strings.ToLower(signature),
+		AccessKey: accessKey, Key: keyRow, PayloadHash: payloadHash, Signature: strings.ToLower(signature),
 		SigningKey: key, Scope: scopeLine, DateTime: datetime,
 	}, nil
 }
@@ -148,6 +157,9 @@ func (a *Authenticator) verifyPresigned(r *http.Request, now time.Time) (*Auth, 
 	if err != nil {
 		return nil, authErr("RequestTimeTooSkewed", "invalid X-Amz-Date")
 	}
+	if date != datetime[:8] {
+		return nil, authErr("InvalidRequest", "credential date does not match X-Amz-Date")
+	}
 	expires, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
 	if err != nil || expires < 1 || expires > 604800 {
 		return nil, authErr("InvalidRequest", "X-Amz-Expires must be between 1 and 604800 seconds")
@@ -162,10 +174,14 @@ func (a *Authenticator) verifyPresigned(r *http.Request, now time.Time) (*Auth, 
 	if payloadHash == "" {
 		payloadHash = "UNSIGNED-PAYLOAD"
 	}
-	secret, active, err := a.Store.GetAccessKeySecret(r.Context(), accessKey)
-	if err != nil || !active {
+	keyRow, err := a.Store.GetAccessKey(r.Context(), accessKey)
+	if err != nil || !keyRow.Active {
 		return nil, authErr("InvalidAccessKeyId", "the access key does not exist or is disabled")
 	}
+	if !keyRow.ExpiresAt.IsZero() && !now.Before(keyRow.ExpiresAt) {
+		return nil, authErr("AccessDenied", "this access key has expired")
+	}
+	secret := keyRow.Secret
 	canonical, aerr := canonicalRequest(r, signedHeaders, payloadHash)
 	if aerr != nil {
 		return nil, aerr
@@ -179,7 +195,7 @@ func (a *Authenticator) verifyPresigned(r *http.Request, now time.Time) (*Auth, 
 	}
 	a.Store.TouchAccessKey(r.Context(), accessKey)
 	return &Auth{
-		AccessKey: accessKey, PayloadHash: payloadHash, Signature: strings.ToLower(signature),
+		AccessKey: accessKey, Key: keyRow, PayloadHash: payloadHash, Signature: strings.ToLower(signature),
 		SigningKey: key, Scope: scopeLine, DateTime: datetime, Presigned: true,
 	}, nil
 }
@@ -240,22 +256,58 @@ func canonicalHeaders(r *http.Request, signedHeaders string) (string, *AuthError
 	return b.String(), nil
 }
 
-// canonicalQuery re-encodes and sorts query parameters per AWS rules.
+// canonicalQuery re-encodes and sorts query parameters per AWS rules. It works
+// from the raw query so a literal '+' stays a plus (Go's Query would decode it
+// as a space) and percent-escaped slashes/Unicode are decoded exactly once.
 func canonicalQuery(r *http.Request) string {
-	values := r.URL.Query()
 	type kv struct{ k, v string }
 	var pairs []kv
-	for k, vs := range values {
-		if k == "X-Amz-Signature" {
-			continue
+	raw := r.URL.RawQuery
+	if raw != "" {
+		for _, part := range strings.Split(raw, "&") {
+			if part == "" {
+				continue
+			}
+			k, v, _ := strings.Cut(part, "=")
+			key, err := url.PathUnescape(k)
+			if err != nil {
+				key = k
+			}
+			value, err := url.PathUnescape(v)
+			if err != nil {
+				value = v
+			}
+			if key == "X-Amz-Signature" {
+				continue
+			}
+			pairs = append(pairs, kv{awsEncode(key), awsEncode(value)})
 		}
-		encodedKey := awsEncode(k)
-		if len(vs) == 0 {
-			pairs = append(pairs, kv{encodedKey, ""})
-			continue
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].k == pairs[j].k {
+			return pairs[i].v < pairs[j].v
 		}
+		return pairs[i].k < pairs[j].k
+	})
+	var b strings.Builder
+	for i, p := range pairs {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(p.k)
+		b.WriteByte('=')
+		b.WriteString(p.v)
+	}
+	return b.String()
+}
+
+// encodeQuery builds a query string using the exact AWS escaping rules.
+func encodeQuery(q url.Values) string {
+	type kv struct{ k, v string }
+	var pairs []kv
+	for k, vs := range q {
 		for _, v := range vs {
-			pairs = append(pairs, kv{encodedKey, awsEncode(v)})
+			pairs = append(pairs, kv{awsEncode(k), awsEncode(v)})
 		}
 	}
 	sort.Slice(pairs, func(i, j int) bool {
@@ -309,22 +361,45 @@ func sha256Hex(data string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// SignQuery appends a presigned signature to rawURL.
+// SignQuery appends a presigned GET signature to rawURL.
 func SignQuery(rawURL, accessKey, secret, region string, expires time.Time) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	return SignQueryMethod(rawURL, accessKey, secret, region, http.MethodGet, expires)
+}
+
+// SignQueryMethod appends a presigned signature for method to rawURL.
+func SignQueryMethod(rawURL, accessKey, secret, region, method string, expires time.Time) (string, error) {
+	if method == "" {
+		method = http.MethodGet
+	}
+	req, err := http.NewRequest(method, rawURL, nil)
 	if err != nil {
 		return "", err
 	}
-	t := expires.UTC()
-	datetime := t.Format("20060102T150405Z")
+	now := time.Now().UTC()
+	if !expires.After(now) {
+		return "", fmt.Errorf("presigned URL expiry must be in the future")
+	}
+	seconds := int64(expires.Sub(now).Seconds())
+	if seconds < 1 {
+		seconds = 1
+	}
+	if seconds > 604800 {
+		return "", fmt.Errorf("presigned URL expiry cannot exceed 7 days")
+	}
+	datetime := now.Format("20060102T150405Z")
 	date := datetime[:8]
-	q := req.URL.Query()
+	existing := strings.TrimSuffix(req.URL.RawQuery, "&")
+	q := url.Values{}
 	q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
 	q.Set("X-Amz-Credential", accessKey+"/"+date+"/"+region+"/s3/aws4_request")
 	q.Set("X-Amz-Date", datetime)
-	q.Set("X-Amz-Expires", strconv.FormatInt(int64(time.Until(t).Seconds()), 10))
+	q.Set("X-Amz-Expires", strconv.FormatInt(seconds, 10))
 	q.Set("X-Amz-SignedHeaders", "host")
-	req.URL.RawQuery = q.Encode()
+	signedQuery := encodeQuery(q)
+	if existing != "" {
+		signedQuery = existing + "&" + signedQuery
+	}
+	req.URL.RawQuery = signedQuery
 	canonical, aerr := canonicalRequest(req, "host", "UNSIGNED-PAYLOAD")
 	if aerr != nil {
 		return "", aerr
@@ -333,6 +408,10 @@ func SignQuery(rawURL, accessKey, secret, region string, expires time.Time) (str
 	stringToSign := "AWS4-HMAC-SHA256\n" + datetime + "\n" + scope + "\n" + sha256Hex(canonical)
 	sig := hex.EncodeToString(hmacSHA256(signingKey(secret, date, region, "s3"), stringToSign))
 	q.Set("X-Amz-Signature", sig)
-	req.URL.RawQuery = q.Encode()
+	finalQuery := encodeQuery(q)
+	if existing != "" {
+		finalQuery = existing + "&" + finalQuery
+	}
+	req.URL.RawQuery = finalQuery
 	return req.URL.String(), nil
 }

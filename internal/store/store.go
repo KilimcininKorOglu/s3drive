@@ -36,6 +36,7 @@ type Account struct {
 	AccessToken  string
 	TokenExpiry  time.Time
 	RootID       string
+	NamespaceID  string
 	NeedsReauth  bool
 	CreatedAt    time.Time
 }
@@ -52,12 +53,50 @@ type Bucket struct {
 // AccessKey is an S3 credential pair. Secret is populated only by
 // GetAccessKeySecret; listings leave it empty.
 type AccessKey struct {
-	AccessKey  string
-	Secret     string
-	Label      string
-	Active     bool
+	AccessKey string
+	Secret    string
+	Label     string
+	Active    bool
+	// Permission is "rw" or "ro".
+	Permission string
+	// Bucket restricts the key to one bucket. Empty means every bucket.
+	Bucket string
+	// Prefix restricts the key to keys beginning with this value.
+	Prefix string
+	// ExpiresAt is zero for keys that never expire.
+	ExpiresAt  time.Time
 	CreatedAt  time.Time
 	LastUsedAt time.Time
+}
+
+// CanRead reports whether the key may read a bucket/key pair.
+func (k *AccessKey) CanRead(bucket, key string) bool {
+	return k.allows(bucket, key)
+}
+
+// CanWrite reports whether the key may mutate a bucket/key pair.
+func (k *AccessKey) CanWrite(bucket, key string) bool {
+	return k.Permission != "ro" && k.allows(bucket, key)
+}
+
+// CanWriteBucket reports whether the key may create/delete a bucket.
+func (k *AccessKey) CanWriteBucket(bucket string) bool {
+	if k.Permission == "ro" || k.Prefix != "" || (k.Bucket != "" && k.Bucket != bucket) {
+		return false
+	}
+	return true
+}
+
+func (k *AccessKey) allows(bucket, key string) bool {
+	if k.Bucket != "" && k.Bucket != bucket {
+		return false
+	}
+	return k.Prefix == "" || strings.HasPrefix(key, k.Prefix)
+}
+
+// Valid reports whether the key is active and not expired.
+func (k *AccessKey) Valid(now time.Time) bool {
+	return k.Active && (k.ExpiresAt.IsZero() || now.Before(k.ExpiresAt))
 }
 
 // Event is one S3 request, used by the dashboard.
@@ -68,19 +107,72 @@ type Event struct {
 	Bucket    string
 	Key       string
 	AccountID string
+	AccessKey string
 	Bytes     int64
 	Status    int
 	MS        int64
 }
 
+// ObjectMeta stores S3 semantics that Google Drive does not expose natively
+// (multipart ETags, user metadata, storage class and checksums).
+type ObjectMeta struct {
+	Bucket       string
+	Key          string
+	ETag         string
+	ContentType  string
+	StorageClass string
+	Metadata     string
+	Checksum     string
+	UpdatedAt    time.Time
+}
+
+// User is a console login. Roles are "admin" (read/write) and "viewer"
+// (read-only).
+type User struct {
+	ID           string
+	Username     string
+	PasswordHash string
+	Role         string
+	CreatedAt    time.Time
+}
+
+// DriveSession records an unfinished Drive resumable upload session.
+type DriveSession struct {
+	Bucket     string
+	Key        string
+	AccountID  string
+	SessionURL string
+	Identity   string
+	Size       int64
+	Offset     int64
+	UpdatedAt  time.Time
+}
+
+// EventFilter selects audit-log rows.
+type EventFilter struct {
+	Op        string
+	Bucket    string
+	Key       string
+	AccessKey string
+	Status    string
+	Since     time.Time
+	Until     time.Time
+	Limit     int
+	Offset    int
+}
+
 // Upload tracks an in-flight S3 multipart upload.
 type Upload struct {
-	ID          string
-	Bucket      string
-	Key         string
-	AccountID   string
-	ContentType string
-	CreatedAt   time.Time
+	ID           string
+	Bucket       string
+	Key          string
+	AccountID    string
+	ContentType  string
+	Metadata     string
+	StorageClass string
+	Checksum     string
+	Size         int64
+	CreatedAt    time.Time
 }
 
 // PoolObject remembers which account holds a key in the virtual pool bucket.
@@ -198,7 +290,103 @@ CREATE TABLE IF NOT EXISTS oauth_states (
 	created_at INTEGER NOT NULL
 );
 `
-	_, err := s.db.Exec(schema)
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Schema v2 additions. addColumn is a no-op when the column already
+	// exists, which keeps upgrades from older databases safe.
+	cols := []struct{ table, name, def string }{
+		{"accounts", "namespace_id", "TEXT NOT NULL DEFAULT ''"},
+		{"access_keys", "permission", "TEXT NOT NULL DEFAULT 'rw'"},
+		{"access_keys", "bucket", "TEXT NOT NULL DEFAULT ''"},
+		{"access_keys", "prefix", "TEXT NOT NULL DEFAULT ''"},
+		{"access_keys", "expires_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"events", "access_key", "TEXT NOT NULL DEFAULT ''"},
+		{"uploads", "updated_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"uploads", "metadata", "TEXT NOT NULL DEFAULT ''"},
+		{"uploads", "storage_class", "TEXT NOT NULL DEFAULT ''"},
+		{"uploads", "checksum", "TEXT NOT NULL DEFAULT ''"},
+		{"uploads", "size", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	for _, c := range cols {
+		if err := s.addColumn(c.table, c.name, c.def); err != nil {
+			return fmt.Errorf("migrate %s.%s: %w", c.table, c.name, err)
+		}
+	}
+
+	const v2 = `
+CREATE TABLE IF NOT EXISTS object_meta (
+	bucket       TEXT NOT NULL,
+	key          TEXT NOT NULL,
+	etag         TEXT NOT NULL DEFAULT '',
+	content_type TEXT NOT NULL DEFAULT '',
+	storage_class TEXT NOT NULL DEFAULT '',
+	metadata     TEXT NOT NULL DEFAULT '',
+	checksum     TEXT NOT NULL DEFAULT '',
+	updated_at   INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (bucket, key)
+);
+CREATE TABLE IF NOT EXISTS upload_usage (
+	account_id TEXT NOT NULL,
+	day        TEXT NOT NULL,
+	bytes      INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (account_id, day)
+);
+CREATE TABLE IF NOT EXISTS users (
+	id            TEXT PRIMARY KEY,
+	username      TEXT NOT NULL UNIQUE,
+	password_hash TEXT NOT NULL,
+	role          TEXT NOT NULL DEFAULT 'admin',
+	created_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS drive_sessions (
+	bucket       TEXT NOT NULL,
+	key          TEXT NOT NULL,
+	account_id   TEXT NOT NULL,
+	session_url  TEXT NOT NULL,
+	identity     TEXT NOT NULL DEFAULT '',
+	size         INTEGER NOT NULL DEFAULT 0,
+	offset       INTEGER NOT NULL DEFAULT 0,
+	updated_at   INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (bucket, key)
+);
+CREATE INDEX IF NOT EXISTS idx_events_key ON events(bucket, key);
+CREATE INDEX IF NOT EXISTS idx_events_access ON events(access_key);
+CREATE INDEX IF NOT EXISTS idx_upload_usage_day ON upload_usage(day);
+`
+	if _, err := s.db.Exec(v2); err != nil {
+		return err
+	}
+	if err := s.addColumn("drive_sessions", "identity", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate drive_sessions.identity: %w", err)
+	}
+	_, err := s.db.Exec(`PRAGMA user_version = 2`)
+	return err
+}
+
+func (s *Store) addColumn(table, name, def string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var cname, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &cname, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if cname == name {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + name + ` ` + def)
 	return err
 }
 
@@ -275,14 +463,14 @@ func (s *Store) CreateAccount(ctx context.Context, a *Account) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO accounts
-		(id,name,email,picture,client_id,client_secret,refresh_token,access_token,token_expiry,root_id,needs_reauth,created_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(id,name,email,picture,client_id,client_secret,refresh_token,access_token,token_expiry,root_id,namespace_id,needs_reauth,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.Name, a.Email, a.Picture, a.ClientID, cs, rt, at,
-		a.TokenExpiry.Unix(), a.RootID, boolInt(a.NeedsReauth), a.CreatedAt.Unix())
+		a.TokenExpiry.Unix(), a.RootID, a.NamespaceID, boolInt(a.NeedsReauth), a.CreatedAt.Unix())
 	return err
 }
 
-const accountCols = `id,name,email,picture,client_id,client_secret,refresh_token,access_token,token_expiry,root_id,needs_reauth,created_at`
+const accountCols = `id,name,email,picture,client_id,client_secret,refresh_token,access_token,token_expiry,root_id,namespace_id,needs_reauth,created_at`
 
 func (s *Store) scanAccount(row interface{ Scan(...any) error }) (*Account, error) {
 	var a Account
@@ -290,7 +478,7 @@ func (s *Store) scanAccount(row interface{ Scan(...any) error }) (*Account, erro
 	var expiry, created int64
 	var reauth int
 	err := row.Scan(&a.ID, &a.Name, &a.Email, &a.Picture, &a.ClientID, &secret, &refresh,
-		&access, &expiry, &a.RootID, &reauth, &created)
+		&access, &expiry, &a.RootID, &a.NamespaceID, &reauth, &created)
 	if err != nil {
 		return nil, err
 	}
@@ -387,10 +575,42 @@ func (s *Store) UpdateAccountProfile(ctx context.Context, id, name, email, pictu
 	return err
 }
 
+// SetAccountNamespace stores the id of the private s3drive folder root.
+func (s *Store) SetAccountNamespace(ctx context.Context, id, namespaceID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET namespace_id=? WHERE id=?`, namespaceID, id)
+	return err
+}
+
+// ClearNamespaceIDs forgets cached namespace folder ids, forcing accounts to
+// resolve the configured namespace again on their next request.
+func (s *Store) ClearNamespaceIDs(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET namespace_id=''`)
+	return err
+}
+
+// UpdateAccountName changes the display name used in the UI.
+func (s *Store) UpdateAccountName(ctx context.Context, id, name string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET name=? WHERE id=?`, name, id)
+	return err
+}
+
 // DeleteAccount removes an account and its buckets. Drive files are untouched.
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id=?`, id)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM folder_cache WHERE account_id=?`,
+		`DELETE FROM drive_sessions WHERE account_id=?`,
+		`DELETE FROM accounts WHERE id=?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ---------------------------------------------------------------------------
@@ -450,10 +670,38 @@ func (s *Store) SetBucketPublic(ctx context.Context, name string, public bool) e
 	return err
 }
 
+// RenameBucket updates every local reference to a bucket name.
+func (s *Store) RenameBucket(ctx context.Context, oldName, newName string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmts := []string{
+		`UPDATE buckets SET name=? WHERE name=?`,
+		`UPDATE object_meta SET bucket=? WHERE bucket=?`,
+		`UPDATE uploads SET bucket=? WHERE bucket=?`,
+		`UPDATE drive_sessions SET bucket=? WHERE bucket=?`,
+		`UPDATE access_keys SET bucket=? WHERE bucket=?`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q, newName, oldName); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // DeleteBucket removes a bucket mapping.
 func (s *Store) DeleteBucket(ctx context.Context, name string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM buckets WHERE name=?`, name)
-	return err
+	if err != nil {
+		return err
+	}
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM object_meta WHERE bucket=?`, name)
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM uploads WHERE bucket=?`, name)
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM drive_sessions WHERE bucket=?`, name)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -468,44 +716,72 @@ func (s *Store) CreateAccessKey(ctx context.Context, k *AccessKey) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO access_keys(access_key,secret,label,active,created_at,last_used_at) VALUES(?,?,?,?,?,?)`,
-		k.AccessKey, enc, k.Label, boolInt(k.Active), k.CreatedAt.Unix(), k.LastUsedAt.Unix())
+	_, err = s.db.ExecContext(ctx, `INSERT INTO access_keys(access_key,secret,label,active,permission,bucket,prefix,expires_at,created_at,last_used_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		k.AccessKey, enc, k.Label, boolInt(k.Active), k.Permission, k.Bucket, k.Prefix,
+		unixOrZero(k.ExpiresAt), k.CreatedAt.Unix(), unixOrZero(k.LastUsedAt))
 	return err
+}
+
+const accessKeyCols = `access_key,secret,label,active,permission,bucket,prefix,expires_at,created_at,last_used_at`
+
+func (s *Store) scanAccessKey(row interface{ Scan(...any) error }) (*AccessKey, error) {
+	var k AccessKey
+	var enc string
+	var active, expires, created, used int64
+	if err := row.Scan(&k.AccessKey, &enc, &k.Label, &active, &k.Permission,
+		&k.Bucket, &k.Prefix, &expires, &created, &used); err != nil {
+		return nil, err
+	}
+	secret, err := s.box.Open(enc)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = secret
+	k.Active = active != 0
+	k.ExpiresAt = fromUnix(expires)
+	k.CreatedAt = fromUnix(created)
+	k.LastUsedAt = fromUnix(used)
+	if k.Permission == "" {
+		k.Permission = "rw"
+	}
+	return &k, nil
+}
+
+// GetAccessKey returns a key with its decrypted secret.
+func (s *Store) GetAccessKey(ctx context.Context, accessKey string) (*AccessKey, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+accessKeyCols+` FROM access_keys WHERE access_key=?`, accessKey)
+	k, err := s.scanAccessKey(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return k, err
 }
 
 // GetAccessKeySecret returns the decrypted secret for signature checks.
 func (s *Store) GetAccessKeySecret(ctx context.Context, accessKey string) (string, bool, error) {
-	var enc string
-	var active int
-	err := s.db.QueryRowContext(ctx, `SELECT secret,active FROM access_keys WHERE access_key=?`, accessKey).Scan(&enc, &active)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, ErrNotFound
-	}
+	k, err := s.GetAccessKey(ctx, accessKey)
 	if err != nil {
 		return "", false, err
 	}
-	secret, err := s.box.Open(enc)
-	return secret, active != 0, err
+	return k.Secret, k.Active, nil
 }
 
 // ListAccessKeys returns keys without their secrets.
 func (s *Store) ListAccessKeys(ctx context.Context) ([]*AccessKey, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT access_key,label,active,created_at,last_used_at FROM access_keys ORDER BY created_at`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+accessKeyCols+` FROM access_keys ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []*AccessKey
 	for rows.Next() {
-		var k AccessKey
-		var active, created, used int64
-		if err := rows.Scan(&k.AccessKey, &k.Label, &active, &created, &used); err != nil {
+		k, err := s.scanAccessKey(rows)
+		if err != nil {
 			return nil, err
 		}
-		k.Active = active != 0
-		k.CreatedAt = fromUnix(created)
-		k.LastUsedAt = fromUnix(used)
-		out = append(out, &k)
+		k.Secret = ""
+		out = append(out, k)
 	}
 	return out, rows.Err()
 }
@@ -563,6 +839,13 @@ func (s *Store) ForgetFolder(ctx context.Context, accountID, folderID string) er
 	return err
 }
 
+// ClearFolderCache drops every cached folder path for one account after a
+// rename or move that invalidates parent/name pairs.
+func (s *Store) ClearFolderCache(ctx context.Context, accountID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM folder_cache WHERE account_id=?`, accountID)
+	return err
+}
+
 // CacheFolderCount is the number of cached folder ids.
 func (s *Store) CacheFolderCount(ctx context.Context) (int64, error) {
 	var n int64
@@ -578,29 +861,103 @@ func (s *Store) AddEvent(ctx context.Context, e Event) error {
 	if e.TS.IsZero() {
 		e.TS = time.Now()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO events(ts,op,bucket,key,account_id,bytes,status,ms) VALUES(?,?,?,?,?,?,?,?)`,
-		e.TS.Unix(), e.Op, e.Bucket, e.Key, e.AccountID, e.Bytes, e.Status, e.MS)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO events(ts,op,bucket,key,account_id,access_key,bytes,status,ms)
+		VALUES(?,?,?,?,?,?,?,?,?)`,
+		e.TS.Unix(), e.Op, e.Bucket, e.Key, e.AccountID, e.AccessKey, e.Bytes, e.Status, e.MS)
 	return err
+}
+
+const eventCols = `id,ts,op,bucket,key,account_id,access_key,bytes,status,ms`
+
+func scanEvent(row interface{ Scan(...any) error }) (*Event, error) {
+	var e Event
+	var ts int64
+	if err := row.Scan(&e.ID, &ts, &e.Op, &e.Bucket, &e.Key, &e.AccountID,
+		&e.AccessKey, &e.Bytes, &e.Status, &e.MS); err != nil {
+		return nil, err
+	}
+	e.TS = fromUnix(ts)
+	return &e, nil
 }
 
 // RecentEvents returns the newest events.
 func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,ts,op,bucket,key,account_id,bytes,status,ms FROM events ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+eventCols+` FROM events ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Event
 	for rows.Next() {
-		var e Event
-		var ts int64
-		if err := rows.Scan(&e.ID, &ts, &e.Op, &e.Bucket, &e.Key, &e.AccountID, &e.Bytes, &e.Status, &e.MS); err != nil {
+		e, err := scanEvent(rows)
+		if err != nil {
 			return nil, err
 		}
-		e.TS = fromUnix(ts)
-		out = append(out, e)
+		out = append(out, *e)
 	}
 	return out, rows.Err()
+}
+
+// ListEvents returns audit rows matching f and the total count of matches.
+func (s *Store) ListEvents(ctx context.Context, f EventFilter) ([]Event, int, error) {
+	var where []string
+	var args []any
+	if f.Op != "" {
+		where = append(where, `op = ?`)
+		args = append(args, f.Op)
+	}
+	if f.Bucket != "" {
+		where = append(where, `bucket = ?`)
+		args = append(args, f.Bucket)
+	}
+	if f.Key != "" {
+		where = append(where, `key LIKE ? ESCAPE '\'`)
+		args = append(args, likePrefix(f.Key))
+	}
+	if f.AccessKey != "" {
+		where = append(where, `access_key = ?`)
+		args = append(args, f.AccessKey)
+	}
+	if f.Status == "ok" {
+		where = append(where, `status < 400`)
+	} else if f.Status == "error" {
+		where = append(where, `status >= 400`)
+	}
+	if !f.Since.IsZero() {
+		where = append(where, `ts >= ?`)
+		args = append(args, f.Since.Unix())
+	}
+	if !f.Until.IsZero() {
+		where = append(where, `ts < ?`)
+		args = append(args, f.Until.Unix())
+	}
+	clause := ""
+	if len(where) > 0 {
+		clause = ` WHERE ` + strings.Join(where, ` AND `)
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	limit := f.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	q := `SELECT ` + eventCols + ` FROM events` + clause + ` ORDER BY id DESC LIMIT ? OFFSET ?`
+	rows, err := s.db.QueryContext(ctx, q, append(args, limit, f.Offset)...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, *e)
+	}
+	return out, total, rows.Err()
 }
 
 // StatsSince aggregates events newer than t.
@@ -630,30 +987,61 @@ func (s *Store) CreateUpload(ctx context.Context, u *Upload) error {
 	if u.CreatedAt.IsZero() {
 		u.CreatedAt = time.Now()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO uploads(id,bucket,key,account_id,content_type,created_at) VALUES(?,?,?,?,?,?)`,
-		u.ID, u.Bucket, u.Key, u.AccountID, u.ContentType, u.CreatedAt.Unix())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO uploads(id,bucket,key,account_id,content_type,metadata,storage_class,checksum,size,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		u.ID, u.Bucket, u.Key, u.AccountID, u.ContentType, u.Metadata, u.StorageClass, u.Checksum, u.Size, u.CreatedAt.Unix())
 	return err
 }
 
-// GetUpload returns an upload by id.
-func (s *Store) GetUpload(ctx context.Context, id, bucket, key string) (*Upload, error) {
+const uploadCols = `id,bucket,key,account_id,content_type,metadata,storage_class,checksum,size,created_at`
+
+func scanUpload(row interface{ Scan(...any) error }) (*Upload, error) {
 	var u Upload
 	var created int64
-	err := s.db.QueryRowContext(ctx, `SELECT id,bucket,key,account_id,content_type,created_at FROM uploads WHERE id=? AND bucket=? AND key=?`,
-		id, bucket, key).Scan(&u.ID, &u.Bucket, &u.Key, &u.AccountID, &u.ContentType, &created)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
+	if err := row.Scan(&u.ID, &u.Bucket, &u.Key, &u.AccountID, &u.ContentType,
+		&u.Metadata, &u.StorageClass, &u.Checksum, &u.Size, &created); err != nil {
 		return nil, err
 	}
 	u.CreatedAt = fromUnix(created)
 	return &u, nil
 }
 
+// GetUpload returns an upload by id.
+func (s *Store) GetUpload(ctx context.Context, id, bucket, key string) (*Upload, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+uploadCols+` FROM uploads WHERE id=? AND bucket=? AND key=?`, id, bucket, key)
+	u, err := scanUpload(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// GetUploadByID returns a multipart upload regardless of bucket/key.
+func (s *Store) GetUploadByID(ctx context.Context, id string) (*Upload, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+uploadCols+` FROM uploads WHERE id=?`, id)
+	u, err := scanUpload(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// CountUploadsByAccount counts in-flight multipart uploads pinned to an account.
+func (s *Store) CountUploadsByAccount(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM uploads WHERE account_id=?`, accountID).Scan(&n)
+	return n, err
+}
+
 // ListUploads returns in-flight uploads for a bucket ("" for all).
 func (s *Store) ListUploads(ctx context.Context, bucket string) ([]*Upload, error) {
-	q := `SELECT id,bucket,key,account_id,content_type,created_at FROM uploads`
+	q := `SELECT ` + uploadCols + ` FROM uploads`
 	args := []any{}
 	if bucket != "" {
 		q += ` WHERE bucket=?`
@@ -667,9 +1055,298 @@ func (s *Store) ListUploads(ctx context.Context, bucket string) ([]*Upload, erro
 	defer rows.Close()
 	var out []*Upload
 	for rows.Next() {
-		var u Upload
+		u, err := scanUpload(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// DeleteUpload removes an upload record.
+func (s *Store) DeleteUpload(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM uploads WHERE id=?`, id)
+	return err
+}
+
+// TouchUpload records activity so abandoned-upload cleanup does not abort a
+// large multipart upload that is still making progress.
+func (s *Store) TouchUpload(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE uploads SET updated_at=? WHERE id=?`, now(), id)
+	return err
+}
+
+// StaleUploads returns multipart uploads older than t.
+func (s *Store) StaleUploads(ctx context.Context, t time.Time) ([]*Upload, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+uploadCols+` FROM uploads
+		WHERE COALESCE(NULLIF(updated_at,0), created_at) < ? ORDER BY created_at`, t.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Upload
+	for rows.Next() {
+		u, err := scanUpload(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Object metadata
+
+// SetObjectMeta upserts S3 metadata for an object.
+func (s *Store) SetObjectMeta(ctx context.Context, m ObjectMeta) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO object_meta(bucket,key,etag,content_type,storage_class,metadata,checksum,updated_at)
+		VALUES(?,?,?,?,?,?,?,?)
+		ON CONFLICT(bucket,key) DO UPDATE SET etag=excluded.etag,content_type=excluded.content_type,
+		storage_class=excluded.storage_class,metadata=excluded.metadata,checksum=excluded.checksum,
+		updated_at=excluded.updated_at`,
+		m.Bucket, m.Key, m.ETag, m.ContentType, m.StorageClass, m.Metadata, m.Checksum, now())
+	return err
+}
+
+// GetObjectMeta returns the stored S3 metadata for an object.
+func (s *Store) GetObjectMeta(ctx context.Context, bucket, key string) (*ObjectMeta, error) {
+	var m ObjectMeta
+	var updated int64
+	err := s.db.QueryRowContext(ctx, `SELECT bucket,key,etag,content_type,storage_class,metadata,checksum,updated_at
+		FROM object_meta WHERE bucket=? AND key=?`, bucket, key).
+		Scan(&m.Bucket, &m.Key, &m.ETag, &m.ContentType, &m.StorageClass, &m.Metadata, &m.Checksum, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	m.UpdatedAt = fromUnix(updated)
+	return &m, nil
+}
+
+// RenameObjectMeta moves S3 metadata when an object key changes.
+func (s *Store) RenameObjectMeta(ctx context.Context, bucket, oldKey, newKey string) error {
+	if oldKey == newKey {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var m ObjectMeta
+	var updated int64
+	err = tx.QueryRowContext(ctx, `SELECT bucket,key,etag,content_type,storage_class,metadata,checksum,updated_at
+		FROM object_meta WHERE bucket=? AND key=?`, bucket, oldKey).
+		Scan(&m.Bucket, &m.Key, &m.ETag, &m.ContentType, &m.StorageClass, &m.Metadata, &m.Checksum, &updated)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO object_meta(bucket,key,etag,content_type,storage_class,metadata,checksum,updated_at)
+			VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bucket,key) DO UPDATE SET etag=excluded.etag,
+			content_type=excluded.content_type,storage_class=excluded.storage_class,metadata=excluded.metadata,
+			checksum=excluded.checksum,updated_at=excluded.updated_at`,
+			bucket, newKey, m.ETag, m.ContentType, m.StorageClass, m.Metadata, m.Checksum, now()); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM object_meta WHERE bucket=? AND key=?`, bucket, oldKey); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RenamePoolObject updates the location index when a pooled key changes.
+func (s *Store) RenamePoolObject(ctx context.Context, oldKey, newKey string) error {
+	if oldKey == newKey {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var p PoolObject
+	var updated int64
+	err = tx.QueryRowContext(ctx, `SELECT key,account_id,file_id,size,updated_at FROM pool_objects WHERE key=?`, oldKey).
+		Scan(&p.Key, &p.AccountID, &p.FileID, &p.Size, &updated)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO pool_objects(key,account_id,file_id,size,updated_at) VALUES(?,?,?,?,?)
+			ON CONFLICT(key) DO UPDATE SET account_id=excluded.account_id,file_id=excluded.file_id,
+			size=excluded.size,updated_at=excluded.updated_at`,
+			newKey, p.AccountID, p.FileID, p.Size, now()); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pool_objects WHERE key=?`, oldKey); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteObjectMeta removes metadata for one object or a key prefix when key
+// ends with "/".
+func (s *Store) DeleteObjectMeta(ctx context.Context, bucket, key string) error {
+	if strings.HasSuffix(key, "/") {
+		_, err := s.db.ExecContext(ctx, `DELETE FROM object_meta WHERE bucket=? AND key LIKE ? ESCAPE '\'`,
+			bucket, likePrefix(key))
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM object_meta WHERE bucket=? AND key=?`, bucket, key)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Upload quota
+
+// AddUploadUsage adds bytes to today's per-account upload counter.
+func (s *Store) AddUploadUsage(ctx context.Context, accountID string, bytes int64) error {
+	if bytes <= 0 {
+		return nil
+	}
+	day := time.Now().UTC().Format("2006-01-02")
+	_, err := s.db.ExecContext(ctx, `INSERT INTO upload_usage(account_id,day,bytes) VALUES(?,?,?)
+		ON CONFLICT(account_id,day) DO UPDATE SET bytes=bytes+excluded.bytes`, accountID, day, bytes)
+	return err
+}
+
+// UploadUsageToday returns today's uploaded byte count for an account.
+func (s *Store) UploadUsageToday(ctx context.Context, accountID string) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(bytes,0) FROM upload_usage WHERE account_id=? AND day=?`,
+		accountID, time.Now().UTC().Format("2006-01-02")).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
+
+// PruneUploadUsage removes counters older than t.
+func (s *Store) PruneUploadUsage(ctx context.Context, t time.Time) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM upload_usage WHERE day < ?`, t.UTC().Format("2006-01-02"))
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Resumable Drive sessions
+
+// PutDriveSession records an unfinished resumable upload.
+func (s *Store) PutDriveSession(ctx context.Context, d DriveSession) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO drive_sessions(bucket,key,account_id,session_url,identity,size,offset,updated_at)
+		VALUES(?,?,?,?,?,?,?,?)
+		ON CONFLICT(bucket,key) DO UPDATE SET account_id=excluded.account_id,session_url=excluded.session_url,
+		identity=excluded.identity,size=excluded.size,offset=excluded.offset,updated_at=excluded.updated_at`,
+		d.Bucket, d.Key, d.AccountID, d.SessionURL, d.Identity, d.Size, d.Offset, now())
+	return err
+}
+
+// GetDriveSession returns a saved resumable session.
+func (s *Store) GetDriveSession(ctx context.Context, bucket, key string) (*DriveSession, error) {
+	var d DriveSession
+	var updated int64
+	err := s.db.QueryRowContext(ctx, `SELECT bucket,key,account_id,session_url,identity,size,offset,updated_at
+		FROM drive_sessions WHERE bucket=? AND key=?`, bucket, key).
+		Scan(&d.Bucket, &d.Key, &d.AccountID, &d.SessionURL, &d.Identity, &d.Size, &d.Offset, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	d.UpdatedAt = fromUnix(updated)
+	return &d, nil
+}
+
+// DeleteDriveSession removes a completed or abandoned session.
+func (s *Store) DeleteDriveSession(ctx context.Context, bucket, key string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM drive_sessions WHERE bucket=? AND key=?`, bucket, key)
+	return err
+}
+
+// PruneDriveSessions removes unfinished sessions older than t.
+func (s *Store) PruneDriveSessions(ctx context.Context, t time.Time) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM drive_sessions WHERE updated_at < ?`, t.Unix())
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Console users
+
+// CountUsers returns the number of console users.
+func (s *Store) CountUsers(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
+	return n, err
+}
+
+// CreateUser inserts a console user.
+func (s *Store) CreateUser(ctx context.Context, u *User) error {
+	if u.ID == "" {
+		u.ID = NewID()
+	}
+	if u.CreatedAt.IsZero() {
+		u.CreatedAt = time.Now()
+	}
+	if u.Role == "" {
+		u.Role = "viewer"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id,username,password_hash,role,created_at) VALUES(?,?,?,?,?)`,
+		u.ID, strings.ToLower(strings.TrimSpace(u.Username)), u.PasswordHash, u.Role, u.CreatedAt.Unix())
+	return err
+}
+
+// GetUserByID looks up a console user by id.
+func (s *Store) GetUserByID(ctx context.Context, id string) (*User, error) {
+	var u User
+	var created int64
+	err := s.db.QueryRowContext(ctx, `SELECT id,username,password_hash,role,created_at FROM users WHERE id=?`, id).
+		Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	u.CreatedAt = fromUnix(created)
+	return &u, nil
+}
+
+// GetUserByUsername looks up a console user.
+func (s *Store) GetUserByUsername(ctx context.Context, username string) (*User, error) {
+	var u User
+	var created int64
+	err := s.db.QueryRowContext(ctx, `SELECT id,username,password_hash,role,created_at FROM users WHERE username=?`,
+		strings.ToLower(strings.TrimSpace(username))).
+		Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	u.CreatedAt = fromUnix(created)
+	return &u, nil
+}
+
+// ListUsers returns console users.
+func (s *Store) ListUsers(ctx context.Context) ([]*User, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,username,password_hash,role,created_at FROM users ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*User
+	for rows.Next() {
+		var u User
 		var created int64
-		if err := rows.Scan(&u.ID, &u.Bucket, &u.Key, &u.AccountID, &u.ContentType, &created); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &created); err != nil {
 			return nil, err
 		}
 		u.CreatedAt = fromUnix(created)
@@ -678,9 +1355,15 @@ func (s *Store) ListUploads(ctx context.Context, bucket string) ([]*Upload, erro
 	return out, rows.Err()
 }
 
-// DeleteUpload removes an upload record.
-func (s *Store) DeleteUpload(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM uploads WHERE id=?`, id)
+// UpdateUserPassword changes a user's password hash.
+func (s *Store) UpdateUserPassword(ctx context.Context, id, hash string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, hash, id)
+	return err
+}
+
+// DeleteUser removes a console user.
+func (s *Store) DeleteUser(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM users WHERE id=?`, id)
 	return err
 }
 
@@ -716,6 +1399,20 @@ func (s *Store) GetPoolObject(ctx context.Context, key string) (*PoolObject, err
 func (s *Store) DeletePoolObject(ctx context.Context, key string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM pool_objects WHERE key=?`, key)
 	return err
+}
+
+// CountPoolObjectsByAccount counts indexed pool objects located on accountID.
+func (s *Store) CountPoolObjectsByAccount(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pool_objects WHERE account_id=?`, accountID).Scan(&n)
+	return n, err
+}
+
+// CountPoolObjects returns the number of indexed pooled objects.
+func (s *Store) CountPoolObjects(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pool_objects`).Scan(&n)
+	return n, err
 }
 
 // ListPoolObjects returns indexed keys with a prefix.
@@ -788,6 +1485,13 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
 }
 
 func likePrefix(prefix string) string {

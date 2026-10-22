@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,6 +53,10 @@ func run() error {
 
 	gc := google.NewClient(st)
 	svc := drive.New(st, gc, cfg.SpoolDir, cfg.PublicURL, logger)
+	svc.MaxObjectBytes = cfg.MaxObjectBytes
+	svc.DailyUploadBytes = cfg.DailyUploadBytes
+	svc.MaxUploadsPerAcct = cfg.MaxUploadsPerAcct
+	svc.DiskReserveBytes = cfg.DiskReserveBytes
 	auth := &s3.Authenticator{Store: st}
 	s3srv := &s3.Server{Store: st, Svc: svc, Auth: auth, Log: logger, SpoolDir: cfg.SpoolDir}
 	ui, err := webui.New(cfg, st, svc, gc, logger)
@@ -135,14 +140,23 @@ func run() error {
 		logger.Error("listener failed", "err", runErr)
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := uiHTTP.Shutdown(shutdownCtx); err != nil {
-		logger.Warn("ui shutdown", "err", err)
-	}
-	if err := s3HTTP.Shutdown(shutdownCtx); err != nil {
-		logger.Warn("s3 shutdown", "err", err)
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := uiHTTP.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("ui shutdown", "err", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := s3HTTP.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("s3 shutdown", "err", err)
+		}
+	}()
+	wg.Wait()
 	return runErr
 }
 
@@ -168,6 +182,17 @@ func maintenance(ctx context.Context, st *store.Store, spoolDir string, log *slo
 	}
 	if err := st.PruneOAuthStates(ctx); err != nil {
 		log.Warn("prune oauth states", "err", err)
+	}
+	if err := st.PruneUploadUsage(ctx, time.Now().AddDate(0, 0, -2)); err != nil {
+		log.Warn("prune upload usage", "err", err)
+	}
+	if err := st.PruneDriveSessions(ctx, time.Now().AddDate(0, 0, -7)); err != nil {
+		log.Warn("prune drive sessions", "err", err)
+	}
+	if n, err := s3.CleanupStaleUploads(ctx, st, spoolDir, time.Now().Add(-24*time.Hour)); err != nil {
+		log.Warn("clean stale multipart uploads", "err", err)
+	} else if n > 0 {
+		log.Info("cleaned stale multipart uploads", "count", n)
 	}
 	if startup {
 		cleanupSpool(spoolDir, 7*24*time.Hour, log)

@@ -28,7 +28,7 @@ const (
 	// exposes.
 	ScopeDrive = "https://www.googleapis.com/auth/drive"
 
-	fileFields = "id,name,mimeType,size,modifiedTime,md5Checksum,parents"
+	fileFields = "id,name,mimeType,size,modifiedTime,md5Checksum,parents,appProperties"
 )
 
 // APIError is a non-2xx response from Google.
@@ -173,7 +173,9 @@ func (c *Client) refreshLocked(ctx context.Context, acct *store.Account, st *tok
 	return tok.AccessToken, nil
 }
 
-// do runs an authenticated request with retries and one forced token refresh.
+// do runs an authenticated request and one forced token refresh. Retries are
+// deliberately limited to safe/idempotent methods: replaying a Drive POST
+// after a timeout can otherwise create a second folder or file.
 func (c *Client) do(ctx context.Context, acct *store.Account, method, url string, body io.Reader, headers map[string]string) (*http.Response, error) {
 	var bodyBytes []byte
 	if body != nil {
@@ -183,6 +185,7 @@ func (c *Client) do(ctx context.Context, acct *store.Account, method, url string
 		}
 		bodyBytes = b
 	}
+	retryable := method == http.MethodGet || method == http.MethodHead || method == http.MethodDelete
 
 	var lastErr error
 	refreshed := false
@@ -209,6 +212,9 @@ func (c *Client) do(ctx context.Context, acct *store.Account, method, url string
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			if !retryable {
+				return nil, err
+			}
 			sleepBackoff(ctx, attempt)
 			continue
 		}
@@ -222,7 +228,7 @@ func (c *Client) do(ctx context.Context, acct *store.Account, method, url string
 		}
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 			lastErr = readAPIError(resp)
-			if attempt < 5 {
+			if retryable && attempt < 5 {
 				sleepBackoff(ctx, attempt)
 				continue
 			}
@@ -277,25 +283,27 @@ func sleepBackoff(ctx context.Context, attempt int) {
 
 // RawFile is the Drive file resource subset used by s3drive.
 type RawFile struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	MimeType     string   `json:"mimeType"`
-	Size         string   `json:"size"`
-	ModifiedTime string   `json:"modifiedTime"`
-	MD5          string   `json:"md5Checksum"`
-	Parents      []string `json:"parents"`
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	MimeType      string            `json:"mimeType"`
+	Size          string            `json:"size"`
+	ModifiedTime  string            `json:"modifiedTime"`
+	MD5           string            `json:"md5Checksum"`
+	Parents       []string          `json:"parents"`
+	AppProperties map[string]string `json:"appProperties"`
 }
 
 // File is a normalized Drive file.
 type File struct {
-	ID       string
-	Name     string
-	MimeType string
-	Size     int64
-	Modified time.Time
-	MD5      string
-	Parents  []string
-	IsFolder bool
+	ID            string
+	Name          string
+	MimeType      string
+	Size          int64
+	Modified      time.Time
+	MD5           string
+	Parents       []string
+	AppProperties map[string]string
+	IsFolder      bool
 }
 
 // FolderMime is the Drive folder MIME type.
@@ -305,14 +313,15 @@ func normalizeFile(r RawFile) File {
 	size, _ := strconv.ParseInt(r.Size, 10, 64)
 	mod, _ := time.Parse(time.RFC3339Nano, r.ModifiedTime)
 	return File{
-		ID:       r.ID,
-		Name:     r.Name,
-		MimeType: r.MimeType,
-		Size:     size,
-		Modified: mod,
-		MD5:      r.MD5,
-		Parents:  r.Parents,
-		IsFolder: r.MimeType == FolderMime,
+		ID:            r.ID,
+		Name:          r.Name,
+		MimeType:      r.MimeType,
+		Size:          size,
+		Modified:      mod,
+		MD5:           r.MD5,
+		Parents:       r.Parents,
+		AppProperties: r.AppProperties,
+		IsFolder:      r.MimeType == FolderMime,
 	}
 }
 
@@ -446,13 +455,89 @@ func (c *Client) GetFile(ctx context.Context, acct *store.Account, id string) (*
 
 // CreateFolder creates a folder under parentID.
 func (c *Client) CreateFolder(ctx context.Context, acct *store.Account, name, parentID string) (*File, error) {
-	body, _ := json.Marshal(map[string]any{
+	return c.CreateFolderWithProps(ctx, acct, name, parentID, nil)
+}
+
+// CreateFolderWithProps creates a folder and attaches private appProperties.
+// s3drive uses this as an ownership marker so it never adopts a pre-existing
+// user folder with the same name.
+func (c *Client) CreateFolderWithProps(ctx context.Context, acct *store.Account, name, parentID string, props map[string]string) (*File, error) {
+	meta := map[string]any{
 		"name":     name,
 		"mimeType": FolderMime,
 		"parents":  []string{parentID},
-	})
+	}
+	if len(props) > 0 {
+		meta["appProperties"] = props
+	}
+	body, _ := json.Marshal(meta)
 	u := fmt.Sprintf("%s/files?fields=%s", driveAPI, fileFields)
 	resp, err := c.do(ctx, acct, http.MethodPost, u, strings.NewReader(string(body)), map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var raw RawFile
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	f := normalizeFile(raw)
+	return &f, nil
+}
+
+// Rename changes a Drive file or folder name.
+func (c *Client) Rename(ctx context.Context, acct *store.Account, id, name string) (*File, error) {
+	body, _ := json.Marshal(map[string]any{"name": name})
+	u := fmt.Sprintf("%s/files/%s?fields=%s", driveAPI, urlEncode(id), fileFields)
+	resp, err := c.do(ctx, acct, http.MethodPatch, u, strings.NewReader(string(body)), map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var raw RawFile
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	f := normalizeFile(raw)
+	return &f, nil
+}
+
+// Move reparents a file or folder without copying its content.
+func (c *Client) Move(ctx context.Context, acct *store.Account, id, newParent string) (*File, error) {
+	old, err := c.GetFile(ctx, acct, id)
+	if err != nil {
+		return nil, err
+	}
+	remove := ""
+	for _, p := range old.Parents {
+		if p != newParent {
+			remove = p
+			break
+		}
+	}
+	if remove == "" {
+		return old, nil
+	}
+	u := fmt.Sprintf("%s/files/%s?addParents=%s&removeParents=%s&fields=%s",
+		driveAPI, urlEncode(id), urlEncode(newParent), urlEncode(remove), fileFields)
+	resp, err := c.do(ctx, acct, http.MethodPatch, u, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var raw RawFile
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	f := normalizeFile(raw)
+	return &f, nil
+}
+
+// SetAppProperties merges private appProperties onto a file/folder.
+func (c *Client) SetAppProperties(ctx context.Context, acct *store.Account, id string, props map[string]string) (*File, error) {
+	body, _ := json.Marshal(map[string]any{"appProperties": props})
+	u := fmt.Sprintf("%s/files/%s?fields=%s", driveAPI, urlEncode(id), fileFields)
+	resp, err := c.do(ctx, acct, http.MethodPatch, u, strings.NewReader(string(body)), map[string]string{"Content-Type": "application/json"})
 	if err != nil {
 		return nil, err
 	}
@@ -501,16 +586,33 @@ func (c *Client) Download(ctx context.Context, acct *store.Account, id, rangeHea
 	return c.do(ctx, acct, http.MethodGet, fmt.Sprintf("%s/files/%s?alt=media&supportsAllDrives=true", driveAPI, urlEncode(id)), nil, headers)
 }
 
+// Export downloads a native Google Doc/Sheet/Slide as a binary MIME type.
+func (c *Client) Export(ctx context.Context, acct *store.Account, id, mime string) (*http.Response, error) {
+	u := fmt.Sprintf("%s/files/%s/export?mimeType=%s&supportsAllDrives=true",
+		driveAPI, urlEncode(id), urlEncode(mime))
+	return c.do(ctx, acct, http.MethodGet, u, nil, nil)
+}
+
+// UploadResume identifies a persisted Drive resumable session. Identity must
+// change whenever the source bytes or target file change.
+type UploadResume struct {
+	Bucket    string
+	Key       string
+	AccountID string
+	Identity  string
+	Size      int64
+}
+
 // Upload creates or replaces file content. When existingID is non-empty the
 // file is updated in place, preserving its id (S3 overwrite semantics).
-func (c *Client) Upload(ctx context.Context, acct *store.Account, existingID, parentID, name, mime string, r io.ReadSeeker, size int64) (*File, error) {
+func (c *Client) Upload(ctx context.Context, acct *store.Account, existingID, parentID, name, mime string, r io.ReadSeeker, size int64, resume *UploadResume) (*File, error) {
 	if mime == "" {
 		mime = "application/octet-stream"
 	}
-	if size <= 4<<20 {
+	if size <= 4<<20 || resume == nil {
 		return c.uploadMultipart(ctx, acct, existingID, parentID, name, mime, r, size)
 	}
-	return c.uploadResumable(ctx, acct, existingID, parentID, name, mime, r, size)
+	return c.uploadResumable(ctx, acct, existingID, parentID, name, mime, r, size, resume)
 }
 
 func (c *Client) uploadMultipart(ctx context.Context, acct *store.Account, existingID, parentID, name, mime string, r io.ReadSeeker, size int64) (*File, error) {
@@ -562,24 +664,170 @@ func (c *Client) uploadMultipart(ctx context.Context, acct *store.Account, exist
 
 const chunkSize = 32 << 20 // multiple of 256 KiB, as Drive requires
 
-func (c *Client) uploadResumable(ctx context.Context, acct *store.Account, existingID, parentID, name, mime string, r io.ReadSeeker, size int64) (*File, error) {
+func (c *Client) uploadResumable(ctx context.Context, acct *store.Account, existingID, parentID, name, mime string, r io.ReadSeeker, size int64, resume *UploadResume) (*File, error) {
+	var lastErr error
 	for restart := 0; restart < 3; restart++ {
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return nil, err
-		}
-		sessionURL, err := c.startResumable(ctx, acct, existingID, parentID, name, mime, size)
+		sessionURL, offset, done, err := c.prepareResume(ctx, acct, resume)
 		if err != nil {
 			return nil, err
 		}
-		file, retry, err := c.putResumableChunks(ctx, acct, sessionURL, r, size)
+		if done != nil {
+			return done, nil
+		}
+		if sessionURL == "" {
+			if _, err := r.Seek(0, io.SeekStart); err != nil {
+				return nil, err
+			}
+			sessionURL, err = c.startResumable(ctx, acct, existingID, parentID, name, mime, size)
+			if err != nil {
+				return nil, err
+			}
+			offset = 0
+			if err := c.saveResume(ctx, resume, sessionURL, 0); err != nil {
+				return nil, err
+			}
+		}
+		if offset > size || offset < 0 {
+			_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
+			sessionURL = ""
+			continue
+		}
+		if offset == size {
+			// A query normally returns the completed file in this case. If it
+			// did not, abandon the stale session and upload again.
+			_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
+			continue
+		}
+		if _, err := r.Seek(offset, io.SeekStart); err != nil {
+			return nil, err
+		}
+		file, retry, err := c.putResumableChunks(ctx, acct, sessionURL, r, size, offset, resume)
 		if err == nil {
+			_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
 			return file, nil
 		}
+		lastErr = err
 		if !retry || ctx.Err() != nil {
 			return nil, err
 		}
 	}
-	return nil, errors.New("upload failed after retries")
+	if lastErr == nil {
+		lastErr = errors.New("upload failed after retries")
+	}
+	return nil, lastErr
+}
+
+// prepareResume looks up a persisted session and asks Drive how many bytes it
+// has committed. It returns a completed file when the previous attempt actually
+// finished before the process stopped.
+func (c *Client) prepareResume(ctx context.Context, acct *store.Account, resume *UploadResume) (string, int64, *File, error) {
+	if resume == nil {
+		return "", 0, nil, nil
+	}
+	d, err := c.Store.GetDriveSession(ctx, resume.Bucket, resume.Key)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", 0, nil, nil
+	}
+	if err != nil {
+		return "", 0, nil, err
+	}
+	if d.AccountID != resume.AccountID || d.Identity != resume.Identity || d.Size != resume.Size || d.SessionURL == "" {
+		_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
+		return "", 0, nil, nil
+	}
+	offset, file, err := c.queryResumable(ctx, acct, d.SessionURL, resume.Size)
+	if errors.Is(err, errResumeGone) {
+		_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
+		return "", 0, nil, nil
+	}
+	if err != nil {
+		return "", 0, nil, err
+	}
+	if file != nil {
+		_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
+		return "", 0, file, nil
+	}
+	return d.SessionURL, offset, nil, nil
+}
+
+var errResumeGone = errors.New("resumable session expired")
+
+// queryResumable asks Drive for the committed byte count of a resumable
+// session. Drive answers 308 with a Range header, or 200 with the file when
+// the upload already completed.
+func (c *Client) queryResumable(ctx context.Context, acct *store.Account, sessionURL string, size int64) (int64, *File, error) {
+	for attempt := 0; attempt < 6; attempt++ {
+		token, err := c.AccessToken(ctx, acct)
+		if err != nil {
+			return 0, nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, sessionURL, nil)
+		if err != nil {
+			return 0, nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return 0, nil, ctx.Err()
+			}
+			sleepBackoff(ctx, attempt)
+			continue
+		}
+		switch {
+		case resp.StatusCode == 308:
+			offset := parseRangeOffset(resp.Header.Get("Range"))
+			resp.Body.Close()
+			return offset, nil, nil
+		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
+			defer resp.Body.Close()
+			var raw RawFile
+			if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+				return 0, nil, err
+			}
+			f := normalizeFile(raw)
+			return 0, &f, nil
+		case resp.StatusCode == http.StatusUnauthorized:
+			resp.Body.Close()
+			if _, err := c.ForceRefresh(ctx, acct); err != nil {
+				return 0, nil, err
+			}
+		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
+			resp.Body.Close()
+			return 0, nil, errResumeGone
+		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+			_ = readAPIError(resp)
+			sleepBackoff(ctx, attempt)
+		default:
+			return 0, nil, readAPIError(resp)
+		}
+	}
+	return 0, nil, errors.New("could not query resumable upload status")
+}
+
+func parseRangeOffset(header string) int64 {
+	header = strings.TrimSpace(header)
+	header = strings.TrimPrefix(header, "bytes=")
+	_, end, ok := strings.Cut(header, "-")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(end), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n + 1
+}
+
+func (c *Client) saveResume(ctx context.Context, resume *UploadResume, sessionURL string, offset int64) error {
+	if resume == nil {
+		return nil
+	}
+	return c.Store.PutDriveSession(ctx, store.DriveSession{
+		Bucket: resume.Bucket, Key: resume.Key, AccountID: resume.AccountID,
+		SessionURL: sessionURL, Identity: resume.Identity, Size: resume.Size, Offset: offset,
+	})
 }
 
 func (c *Client) startResumable(ctx context.Context, acct *store.Account, existingID, parentID, name, mime string, size int64) (string, error) {
@@ -610,8 +858,7 @@ func (c *Client) startResumable(ctx context.Context, acct *store.Account, existi
 	return session, nil
 }
 
-func (c *Client) putResumableChunks(ctx context.Context, acct *store.Account, sessionURL string, r io.ReadSeeker, size int64) (*File, bool, error) {
-	offset := int64(0)
+func (c *Client) putResumableChunks(ctx context.Context, acct *store.Account, sessionURL string, r io.ReadSeeker, size int64, offset int64, resume *UploadResume) (*File, bool, error) {
 	buf := make([]byte, chunkSize)
 	for offset < size {
 		n := int64(len(buf))
@@ -647,8 +894,18 @@ func (c *Client) putResumableChunks(ctx context.Context, acct *store.Account, se
 			}
 			switch {
 			case resp.StatusCode == 308:
+				if committed := parseRangeOffset(resp.Header.Get("Range")); committed > offset {
+					offset = committed
+				} else {
+					offset += n
+				}
 				resp.Body.Close()
-				offset += n
+				if _, err := r.Seek(offset, io.SeekStart); err != nil {
+					return nil, false, err
+				}
+				if err := c.saveResume(ctx, resume, sessionURL, offset); err != nil {
+					return nil, false, err
+				}
 				lastErr = nil
 				goto nextChunk
 			case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
@@ -680,7 +937,7 @@ func (c *Client) putResumableChunks(ctx context.Context, acct *store.Account, se
 		}
 	nextChunk:
 	}
-	return nil, false, errors.New("upload finished without a response")
+	return nil, true, errors.New("upload finished without a response")
 }
 
 // ---------------------------------------------------------------------------

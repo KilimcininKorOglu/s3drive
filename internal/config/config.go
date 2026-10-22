@@ -34,6 +34,16 @@ type Config struct {
 	SpoolDir    string
 	SessionTTL  time.Duration
 
+	MaxObjectBytes    int64
+	DailyUploadBytes  int64
+	MaxUploadsPerAcct int
+	DiskReserveBytes  int64
+	MaxUIBodyBytes    int64
+	ShutdownTimeout   time.Duration
+	LoginMaxFailures  int
+	LoginWindow       time.Duration
+	LoginLockout      time.Duration
+
 	// TrustProxy makes the UI honour X-Forwarded-* headers. Enable it only
 	// behind a reverse proxy you control.
 	TrustProxy bool
@@ -56,6 +66,44 @@ func Load() (Config, error) {
 		UIPassword:  os.Getenv("S3DRIVE_UI_PASSWORD"),
 		LogLevel:    env("S3DRIVE_LOG_LEVEL", "info"),
 		SessionTTL:  12 * time.Hour,
+
+		MaxObjectBytes:    5 * (1 << 40),
+		DailyUploadBytes:  750 * (1 << 30),
+		MaxUploadsPerAcct: 4,
+		DiskReserveBytes:  1 << 30,
+		MaxUIBodyBytes:    1 << 30,
+		ShutdownTimeout:   5 * time.Minute,
+		LoginMaxFailures:  5,
+		LoginWindow:       15 * time.Minute,
+		LoginLockout:      15 * time.Minute,
+	}
+
+	if c.MaxObjectBytes, err = envBytes("S3DRIVE_MAX_OBJECT_BYTES", c.MaxObjectBytes); err != nil {
+		return c, err
+	}
+	if c.DailyUploadBytes, err = envBytes("S3DRIVE_DAILY_UPLOAD_BYTES", c.DailyUploadBytes); err != nil {
+		return c, err
+	}
+	if c.MaxUploadsPerAcct, err = envInt("S3DRIVE_MAX_CONCURRENT_UPLOADS", c.MaxUploadsPerAcct); err != nil {
+		return c, err
+	}
+	if c.DiskReserveBytes, err = envBytes("S3DRIVE_DISK_RESERVE_BYTES", c.DiskReserveBytes); err != nil {
+		return c, err
+	}
+	if c.MaxUIBodyBytes, err = envBytes("S3DRIVE_MAX_UI_BODY_BYTES", c.MaxUIBodyBytes); err != nil {
+		return c, err
+	}
+	if c.ShutdownTimeout, err = envDuration("S3DRIVE_SHUTDOWN_TIMEOUT", c.ShutdownTimeout); err != nil {
+		return c, err
+	}
+	if c.LoginMaxFailures, err = envInt("S3DRIVE_LOGIN_MAX_FAILURES", c.LoginMaxFailures); err != nil {
+		return c, err
+	}
+	if c.LoginWindow, err = envDuration("S3DRIVE_LOGIN_WINDOW", c.LoginWindow); err != nil {
+		return c, err
+	}
+	if c.LoginLockout, err = envDuration("S3DRIVE_LOGIN_LOCKOUT", c.LoginLockout); err != nil {
+		return c, err
 	}
 
 	if v := os.Getenv("S3DRIVE_SPOOL_DIR"); v != "" {
@@ -89,4 +137,51 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envInt(key string, def int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return def, fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	return n, nil
+}
+
+func envBytes(key string, def int64) (int64, error) {
+	v := strings.ToUpper(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		return def, nil
+	}
+	mult := int64(1)
+	for suffix, m := range map[string]int64{
+		"KIB": 1 << 10, "MIB": 1 << 20, "GIB": 1 << 30, "TIB": 1 << 40,
+		"KB": 1000, "MB": 1000 * 1000, "GB": 1000 * 1000 * 1000, "TB": 1000 * 1000 * 1000 * 1000,
+	} {
+		if strings.HasSuffix(v, suffix) {
+			mult = m
+			v = strings.TrimSuffix(v, suffix)
+			break
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || n < 0 {
+		return def, fmt.Errorf("%s must be a byte count (for example 5GiB)", key)
+	}
+	return n * mult, nil
+}
+
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return def, fmt.Errorf("%s must be a duration (for example 5m)", key)
+	}
+	return d, nil
 }

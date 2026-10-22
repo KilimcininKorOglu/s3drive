@@ -3,11 +3,14 @@ package s3
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
+	"hash/crc32"
 	"io"
 	"strconv"
 	"strings"
@@ -15,19 +18,35 @@ import (
 
 // newPayloadReader wraps an AWS streaming (aws-chunked) body. For the signed
 // variants, every chunk signature is verified against the request signature.
-func newPayloadReader(body io.ReadCloser, auth *Auth) io.ReadCloser {
+// Trailer checksums are verified when the client advertises them.
+func newPayloadReader(body io.ReadCloser, auth *Auth, trailerHeader string) io.ReadCloser {
 	if auth == nil || !strings.HasPrefix(auth.PayloadHash, "STREAMING-") {
 		return body
 	}
 	verify := strings.HasPrefix(auth.PayloadHash, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
-	return &chunkedReader{
+	c := &chunkedReader{
 		br:        bufio.NewReaderSize(body, 64*1024),
 		body:      body,
 		auth:      auth,
 		verify:    verify,
 		prevSig:   auth.Signature,
 		chunkHash: sha256.New(),
+		trailers:  map[string]hash.Hash{},
 	}
+	for _, name := range strings.Split(trailerHeader, ",") {
+		name = strings.ToLower(strings.TrimSpace(name))
+		switch name {
+		case "x-amz-checksum-sha256":
+			c.trailers[name] = sha256.New()
+		case "x-amz-checksum-sha1":
+			c.trailers[name] = sha1.New()
+		case "x-amz-checksum-crc32":
+			c.trailers[name] = crc32.NewIEEE()
+		case "x-amz-checksum-crc32c":
+			c.trailers[name] = crc32.New(crc32.MakeTable(crc32.Castagnoli))
+		}
+	}
+	return c
 }
 
 type chunkedReader struct {
@@ -40,6 +59,7 @@ type chunkedReader struct {
 	prevSig   string
 	chunkHash hash.Hash
 	chunkSig  string
+	trailers  map[string]hash.Hash
 }
 
 func (c *chunkedReader) Read(p []byte) (int, error) {
@@ -64,6 +84,9 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 			c.remaining -= int64(read)
 			if c.verify {
 				c.chunkHash.Write(p[:read])
+			}
+			for _, h := range c.trailers {
+				_, _ = h.Write(p[:read])
 			}
 			if c.remaining == 0 {
 				if ferr := c.finishChunk(); ferr != nil && err == nil {
@@ -99,7 +122,13 @@ func (c *chunkedReader) nextChunk() error {
 		c.chunkHash.Reset()
 	}
 	if size == 0 {
+		// The zero-size chunk is signed as well; verify it before consuming
+		// the trailer block.
+		if err := c.checkChunkSignature(); err != nil {
+			return err
+		}
 		// Consume optional trailers, then the terminating blank line.
+		seen := map[string]string{}
 		for {
 			line, err := c.readLine()
 			if err != nil {
@@ -110,6 +139,20 @@ func (c *chunkedReader) nextChunk() error {
 			}
 			if line == "" {
 				break
+			}
+			name, value, ok := strings.Cut(line, ":")
+			if ok {
+				seen[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
+			}
+		}
+		for name, h := range c.trailers {
+			want, ok := seen[name]
+			if !ok || want == "" {
+				return fmt.Errorf("aws-chunked: missing trailer %s", name)
+			}
+			got := base64.StdEncoding.EncodeToString(h.Sum(nil))
+			if got != want {
+				return fmt.Errorf("aws-chunked: %s checksum mismatch", name)
 			}
 		}
 		c.done = true
@@ -123,6 +166,10 @@ func (c *chunkedReader) finishChunk() error {
 	if err := c.discardCRLF(); err != nil {
 		return err
 	}
+	return c.checkChunkSignature()
+}
+
+func (c *chunkedReader) checkChunkSignature() error {
 	if !c.verify {
 		return nil
 	}

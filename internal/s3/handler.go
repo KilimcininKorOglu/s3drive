@@ -2,11 +2,15 @@
 package s3
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -58,7 +62,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if auth != nil {
-		r.Body = newPayloadReader(r.Body, auth)
+		oc.accessKey = auth.AccessKey
+		oc.keyPolicy = auth.Key
+		if !s.authorize(oc, auth) {
+			return
+		}
+		if !validPayloadHash(auth.PayloadHash) {
+			writeS3Error(oc.w, r, reqID, "InvalidArgument", "unsupported x-amz-content-sha256", http.StatusBadRequest)
+			return
+		}
+		r.Body = newPayloadReader(r.Body, auth, r.Header.Get("x-amz-trailer"))
+		r.Body = verifyPayloadHash(r.Body, auth.PayloadHash)
 		defer r.Body.Close()
 	}
 
@@ -93,17 +107,74 @@ func (s *Server) authenticate(r *http.Request, bucket, key string) (*Auth, *Auth
 	return nil, nil
 }
 
+// authorize applies the access key's bucket/prefix/read-write policy.
+func (s *Server) authorize(o *opCtx, a *Auth) bool {
+	k := a.Key
+	if k == nil {
+		return true
+	}
+	deny := func() bool {
+		writeS3Error(o.w, o.r, o.reqID, "AccessDenied", "this access key is not allowed to perform this operation", http.StatusForbidden)
+		return false
+	}
+	read := o.r.Method == http.MethodGet || o.r.Method == http.MethodHead
+	if o.bucket == "" {
+		return read
+	}
+	if o.key == "" {
+		if read {
+			if k.Bucket != "" && k.Bucket != o.bucket {
+				return deny()
+			}
+			if k.Prefix != "" && (o.r.URL.Query().Get("uploads") != "" || o.r.URL.Query().Get("list-type") == "2" || o.r.Method == http.MethodGet) {
+				q := o.r.URL.Query()
+				p := q.Get("prefix")
+				if p == "" {
+					q.Set("prefix", k.Prefix)
+					o.r.URL.RawQuery = q.Encode()
+				} else if !strings.HasPrefix(p, k.Prefix) {
+					return deny()
+				}
+			}
+			return true
+		}
+		if o.r.Method == http.MethodPut || o.r.Method == http.MethodDelete {
+			if !k.CanWriteBucket(o.bucket) {
+				return deny()
+			}
+			return true
+		}
+		// DeleteObjects checks each key individually.
+		if hasQuery(o.r, "delete") {
+			return k.Bucket == "" || k.Bucket == o.bucket
+		}
+		return deny()
+	}
+	if read {
+		if !k.CanRead(o.bucket, o.key) {
+			return deny()
+		}
+		return true
+	}
+	if !k.CanWrite(o.bucket, o.key) {
+		return deny()
+	}
+	return true
+}
+
 type opCtx struct {
-	w       *statusWriter
-	r       *http.Request
-	reqID   string
-	cfg     drive.Settings
-	bucket  string
-	key     string
-	op      string
-	acctID  string
-	bytes   int64
-	started time.Time
+	w         *statusWriter
+	r         *http.Request
+	reqID     string
+	cfg       drive.Settings
+	bucket    string
+	key       string
+	op        string
+	acctID    string
+	accessKey string
+	keyPolicy *store.AccessKey
+	bytes     int64
+	started   time.Time
 }
 
 func (o *opCtx) record(s *Server) {
@@ -114,7 +185,7 @@ func (o *opCtx) record(s *Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = s.Store.AddEvent(ctx, store.Event{
-		Op: o.op, Bucket: o.bucket, Key: o.key, AccountID: o.acctID,
+		Op: o.op, Bucket: o.bucket, Key: o.key, AccountID: o.acctID, AccessKey: o.accessKey,
 		Bytes: o.bytes, Status: status, MS: time.Since(o.started).Milliseconds(),
 	})
 	if status >= 500 {
@@ -130,8 +201,14 @@ func (s *Server) bucketRequest(o *opCtx) {
 	case http.MethodHead:
 		s.headBucket(o)
 	case http.MethodPut:
+		if s.bucketSubresource(o) {
+			return
+		}
 		s.createBucket(o)
 	case http.MethodDelete:
+		if s.bucketSubresource(o) {
+			return
+		}
 		s.deleteBucket(o)
 	case http.MethodGet:
 		if s.bucketSubresource(o) {
@@ -145,6 +222,9 @@ func (s *Server) bucketRequest(o *opCtx) {
 	case http.MethodPost:
 		if hasQuery(o.r, "delete") {
 			s.deleteObjects(o)
+			return
+		}
+		if s.bucketSubresource(o) {
 			return
 		}
 		s.methodNotAllowed(o)
@@ -208,6 +288,9 @@ func (s *Server) listBuckets(o *opCtx) {
 		Owner: owner{ID: "s3drive", DisplayName: "s3drive"},
 	}
 	for _, b := range buckets {
+		if o.keyPolicy != nil && o.keyPolicy.Bucket != "" && b.Name != o.keyPolicy.Bucket {
+			continue
+		}
 		created := time.Now().UTC()
 		if b.Row != nil && !b.Row.CreatedAt.IsZero() {
 			created = b.Row.CreatedAt
@@ -269,9 +352,10 @@ func (s *Server) listObjects(o *opCtx) {
 			writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid max-keys", http.StatusBadRequest)
 			return
 		}
-		if n > 0 {
-			maxKeys = n
-		}
+		maxKeys = n
+	}
+	if maxKeys > 1000 {
+		maxKeys = 1000
 	}
 	v2 := q.Get("list-type") == "2"
 	var after string
@@ -309,27 +393,40 @@ func (s *Server) listObjects(o *opCtx) {
 		IsTruncated:  res.IsTruncated,
 		EncodingType: encoding,
 	}
+	fetchOwner := q.Get("fetch-owner") == "true"
 	for _, obj := range res.Objects {
-		out.Contents = append(out.Contents, listObject{
+		item := listObject{
 			Key:          encodeKey(obj.Key, encoding),
 			LastModified: xmlTime(obj.Modified),
 			ETag:         quoteETag(obj.ETag),
 			Size:         obj.Size,
-			StorageClass: "STANDARD",
-		})
+			StorageClass: obj.StorageClass,
+		}
+		if item.StorageClass == "" {
+			item.StorageClass = "STANDARD"
+		}
+		if fetchOwner {
+			id := obj.AccountID
+			if id == "" {
+				id = "s3drive"
+			}
+			item.Owner = &owner{ID: id, DisplayName: obj.AccountMail}
+		}
+		out.Contents = append(out.Contents, item)
 	}
 	for _, p := range res.CommonPrefixes {
 		out.CommonPrefixes = append(out.CommonPrefixes, commonPrefix{Prefix: encodeKey(p, encoding)})
 	}
 	if v2 {
-		out.KeyCount = len(res.Objects) + len(res.CommonPrefixes)
+		keyCount := len(res.Objects) + len(res.CommonPrefixes)
+		out.KeyCount = &keyCount
 		out.ContinuationToken = q.Get("continuation-token")
 		out.StartAfter = q.Get("start-after")
 		if res.IsTruncated {
 			out.NextContinuationToken = base64.RawURLEncoding.EncodeToString([]byte(res.NextAfter))
 		}
 	} else {
-		out.Marker = after
+		out.Marker = encodeKey(after, encoding)
 		if res.IsTruncated {
 			out.NextMarker = encodeKey(res.NextAfter, encoding)
 		}
@@ -354,27 +451,120 @@ func (s *Server) putObject(o *opCtx) {
 		o.w.WriteHeader(http.StatusOK)
 		return
 	}
-	expected, aerr := contentMD5(o.r)
+	expectedMD5, aerr := contentMD5(o.r)
 	if aerr != nil {
 		writeS3Error(o.w, o.r, o.reqID, aerr.Code, aerr.Message, aerr.Status)
+		return
+	}
+	expected := expectedChecksums(o.r)
+	if expectedMD5 != "" {
+		expected["md5"] = expectedMD5
+	}
+	if !s.checkWriteConditions(o) {
 		return
 	}
 	contentType := o.r.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	res, err := s.Svc.PutVerified(o.r.Context(), o.bucket, o.key, contentType, o.r.Body, expected)
+	storageClass := strings.ToUpper(strings.TrimSpace(o.r.Header.Get("x-amz-storage-class")))
+	if storageClass == "" {
+		storageClass = "STANDARD"
+	}
+	res, err := s.Svc.PutChecked(o.r.Context(), o.bucket, o.key, contentType, o.r.Body, expected)
 	if err != nil {
 		s.fail(o, err)
 		return
 	}
+	meta := store.ObjectMeta{
+		Bucket: o.bucket, Key: o.key, ETag: res.ETag, ContentType: contentType,
+		StorageClass: storageClass, Metadata: userMetadataJSON(o.r),
+		Checksum: drive.ChecksumHeader(expected),
+	}
+	_ = s.Svc.SetObjectMeta(o.r.Context(), meta)
 	o.acctID, o.bytes = res.AccountID, res.Size
+	setChecksumResponse(o, meta.Checksum)
 	o.w.Header().Set("ETag", quoteETag(res.ETag))
 	o.w.WriteHeader(http.StatusOK)
 }
 
+// checkWriteConditions implements If-None-Match: * and If-Match for writes.
+func (s *Server) checkWriteConditions(o *opCtx) bool {
+	ifNone := o.r.Header.Get("If-None-Match")
+	ifMatch := o.r.Header.Get("If-Match")
+	if ifNone == "" && ifMatch == "" {
+		return true
+	}
+	obj, _, err := s.Svc.Stat(o.r.Context(), o.bucket, o.key)
+	if err != nil && !drive.IsNotFound(err) {
+		s.fail(o, err)
+		return false
+	}
+	exists := err == nil
+	if ifNone == "*" && exists {
+		writeS3Error(o.w, o.r, o.reqID, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", http.StatusPreconditionFailed)
+		return false
+	}
+	if ifMatch != "" && (!exists || (ifMatch != "*" && !etagMatches(ifMatch, obj.ETag))) {
+		writeS3Error(o.w, o.r, o.reqID, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", http.StatusPreconditionFailed)
+		return false
+	}
+	return true
+}
+
+func expectedChecksums(r *http.Request) map[string]string {
+	out := map[string]string{}
+	for _, alg := range []string{"sha256", "sha1", "crc32", "crc32c"} {
+		if v := r.Header.Get("x-amz-checksum-" + alg); v != "" {
+			out[alg] = v
+		}
+	}
+	return out
+}
+
+func userMetadataJSON(r *http.Request) string {
+	meta := map[string]string{}
+	for k, vs := range r.Header {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "x-amz-meta-") {
+			meta[strings.TrimPrefix(lk, "x-amz-meta-")] = strings.Join(vs, ",")
+		}
+	}
+	if len(meta) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(meta)
+	return string(b)
+}
+
+func setChecksumResponse(o *opCtx, checksum string) {
+	for _, part := range strings.Split(checksum, ";") {
+		k, v, ok := strings.Cut(part, "=")
+		if ok && v != "" {
+			o.w.Header().Set(k, v)
+		}
+	}
+}
+
 func (s *Server) getObject(o *opCtx) {
 	rangeHeader := o.r.Header.Get("Range")
+	total := int64(-1)
+	var modified time.Time
+	if rangeHeader != "" {
+		stat, _, err := s.Svc.Stat(o.r.Context(), o.bucket, o.key)
+		if err != nil {
+			s.fail(o, err)
+			return
+		}
+		total, modified = stat.Size, stat.Modified
+		if ifRange := o.r.Header.Get("If-Range"); ifRange != "" && !ifRangeMatches(ifRange, stat.ETag, modified) {
+			rangeHeader = ""
+		} else if _, _, _, ok := parseByteRange(rangeHeader, total); !ok {
+			o.w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(total, 10))
+			writeS3Error(o.w, o.r, o.reqID, "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+	}
 	obj, err := s.Svc.Get(o.r.Context(), o.bucket, o.key, rangeHeader)
 	if err != nil {
 		s.fail(o, err)
@@ -414,11 +604,81 @@ func (s *Server) headObject(o *opCtx) {
 	}
 	o.acctID = acctIDOf(acct)
 	o.bytes = obj.Size
-	if done := checkConditions(o, &drive.ObjectReader{Object: *obj}); done {
+	reader := &drive.ObjectReader{Object: *obj}
+	if done := checkConditions(o, reader); done {
 		return
 	}
-	setObjectHeaders(o, &drive.ObjectReader{Object: *obj})
+	rangeHeader := o.r.Header.Get("Range")
+	if rangeHeader != "" && ifRangeMatches(o.r.Header.Get("If-Range"), obj.ETag, obj.Modified) {
+		start, end, _, ok := parseByteRange(rangeHeader, obj.Size)
+		if !ok {
+			o.w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(obj.Size, 10))
+			writeS3Error(o.w, o.r, o.reqID, "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		setObjectHeaders(o, reader)
+		o.w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		o.w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, obj.Size))
+		o.w.WriteHeader(http.StatusPartialContent)
+		return
+	}
+	setObjectHeaders(o, reader)
 	o.w.WriteHeader(http.StatusOK)
+}
+
+// ifRangeMatches reports whether an If-Range validator still matches. An
+// empty validator is treated as a match.
+func ifRangeMatches(value, etag string, modified time.Time) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return true
+	}
+	if strings.HasPrefix(value, `"`) || strings.HasPrefix(value, "W/") {
+		return etagMatches(value, etag)
+	}
+	t, err := http.ParseTime(value)
+	return err == nil && !modified.After(t)
+}
+
+// parseByteRange parses one HTTP byte range. It returns inclusive bounds and
+// satisfiable=false for syntactically valid but out-of-bounds ranges.
+func parseByteRange(value string, size int64) (start, end int64, length int64, ok bool) {
+	if !strings.HasPrefix(value, "bytes=") || strings.Contains(value, ",") || size < 0 {
+		return 0, 0, 0, false
+	}
+	spec := strings.TrimSpace(strings.TrimPrefix(value, "bytes="))
+	a, b, hasDash := strings.Cut(spec, "-")
+	if !hasDash {
+		return 0, 0, 0, false
+	}
+	if a == "" {
+		n, err := strconv.ParseInt(strings.TrimSpace(b), 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, 0, false
+		}
+		if n > size {
+			n = size
+		}
+		if n == 0 {
+			return 0, 0, 0, false
+		}
+		return size - n, size - 1, n, true
+	}
+	start, err := strconv.ParseInt(a, 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return 0, 0, 0, false
+	}
+	end = size - 1
+	if strings.TrimSpace(b) != "" {
+		end, err = strconv.ParseInt(strings.TrimSpace(b), 10, 64)
+		if err != nil || end < start {
+			return 0, 0, 0, false
+		}
+		if end >= size {
+			end = size - 1
+		}
+	}
+	return start, end, end - start + 1, true
 }
 
 func setObjectHeaders(o *opCtx, obj *drive.ObjectReader) {
@@ -434,6 +694,18 @@ func setObjectHeaders(o *opCtx, obj *drive.ObjectReader) {
 	}
 	h.Set("Accept-Ranges", "bytes")
 	h.Set("Content-Length", strconv.FormatInt(obj.Object.Size, 10))
+	if obj.Object.StorageClass != "" && obj.Object.StorageClass != "STANDARD" {
+		h.Set("x-amz-storage-class", obj.Object.StorageClass)
+	}
+	for k, v := range obj.Object.Metadata {
+		h.Set("x-amz-meta-"+k, v)
+	}
+	for _, part := range strings.Split(obj.Object.Checksum, ";") {
+		k, v, ok := strings.Cut(part, "=")
+		if ok && v != "" {
+			h.Set(k, v)
+		}
+	}
 	if obj.ContentRange != "" {
 		h.Set("Content-Range", obj.ContentRange)
 	}
@@ -502,11 +774,42 @@ func (s *Server) copyObject(o *opCtx) {
 		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid x-amz-copy-source", http.StatusBadRequest)
 		return
 	}
+	if o.keyPolicy != nil && !o.keyPolicy.CanRead(srcBucket, srcKey) {
+		writeS3Error(o.w, o.r, o.reqID, "AccessDenied", "access denied by key policy", http.StatusForbidden)
+		return
+	}
+	directive := strings.ToUpper(strings.TrimSpace(o.r.Header.Get("x-amz-metadata-directive")))
+	if directive == "" {
+		directive = "COPY"
+	}
+	if directive != "COPY" && directive != "REPLACE" {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "x-amz-metadata-directive must be COPY or REPLACE", http.StatusBadRequest)
+		return
+	}
 	res, err := s.Svc.Copy(o.r.Context(), srcBucket, srcKey, o.bucket, o.key)
 	if err != nil {
 		s.fail(o, err)
 		return
 	}
+	meta := store.ObjectMeta{Bucket: o.bucket, Key: o.key, ETag: res.ETag}
+	if directive == "COPY" {
+		if src, err := s.Svc.ObjectMeta(o.r.Context(), srcBucket, srcKey); err == nil {
+			if src.ETag != "" {
+				meta.ETag = src.ETag
+				res.ETag = src.ETag
+			}
+			meta.ContentType = src.ContentType
+			meta.StorageClass = src.StorageClass
+			meta.Metadata = src.Metadata
+			meta.Checksum = src.Checksum
+		}
+	}
+	if directive == "REPLACE" {
+		meta.ContentType = o.r.Header.Get("Content-Type")
+		meta.StorageClass = strings.ToUpper(strings.TrimSpace(o.r.Header.Get("x-amz-storage-class")))
+		meta.Metadata = userMetadataJSON(o.r)
+	}
+	_ = s.Svc.SetObjectMeta(o.r.Context(), meta)
 	o.acctID = res.AccountID
 	writeXML(o.w, http.StatusOK, copyObjectResult{
 		LastModified: xmlTime(res.Modified),
@@ -515,8 +818,21 @@ func (s *Server) copyObject(o *opCtx) {
 }
 
 func (s *Server) deleteObjects(o *opCtx) {
+	body, err := io.ReadAll(io.LimitReader(o.r.Body, 4<<20))
+	if err != nil {
+		s.fail(o, err)
+		return
+	}
+	if v := o.r.Header.Get("Content-MD5"); v != "" {
+		raw, derr := base64.StdEncoding.DecodeString(v)
+		sum := md5.Sum(body)
+		if derr != nil || len(raw) != 16 || !bytes.Equal(raw, sum[:]) {
+			writeS3Error(o.w, o.r, o.reqID, "BadDigest", "the Content-MD5 you specified did not match what we received", http.StatusBadRequest)
+			return
+		}
+	}
 	var req deleteObjectsRequest
-	if err := xml.NewDecoder(io.LimitReader(o.r.Body, 4<<20)).Decode(&req); err != nil {
+	if err := xml.Unmarshal(body, &req); err != nil {
 		writeS3Error(o.w, o.r, o.reqID, "MalformedXML", "the XML you provided was not well-formed", http.StatusBadRequest)
 		return
 	}
@@ -526,6 +842,10 @@ func (s *Server) deleteObjects(o *opCtx) {
 	}
 	out := deleteResult{Xmlns: xmlNS}
 	for _, item := range req.Objects {
+		if o.keyPolicy != nil && !o.keyPolicy.CanWrite(o.bucket, item.Key) {
+			out.Errors = append(out.Errors, deleteErrItem{Key: item.Key, Code: "AccessDenied", Message: "access denied by key policy"})
+			continue
+		}
 		if err := s.Svc.Delete(o.r.Context(), o.bucket, item.Key); err != nil && !drive.IsNotFound(err) {
 			out.Errors = append(out.Errors, deleteErrItem{Key: item.Key, Code: drive.CodeOf(err), Message: err.Error()})
 			continue
@@ -546,6 +866,10 @@ func (s *Server) bucketSubresource(o *opCtx) bool {
 		"logging", "accelerate", "publicAccessBlock", "ownershipControls", "intelligent-tiering", "inventory") {
 		return false
 	}
+	if _, err := s.Svc.Bucket(o.r.Context(), o.bucket); err != nil {
+		s.fail(o, err)
+		return true
+	}
 	if hasQuery(o.r, "location") {
 		writeXML(o.w, http.StatusOK, locationConstraint{Xmlns: xmlNS, Value: o.cfg.Region})
 		return true
@@ -556,7 +880,14 @@ func (s *Server) bucketSubresource(o *opCtx) bool {
 	case hasQuery(o.r, "acl"):
 		writeRawXML(o.w, http.StatusOK, `<AccessControlPolicy xmlns="`+xmlNS+`"><Owner><ID>s3drive</ID><DisplayName>s3drive</DisplayName></Owner><AccessControlList><Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser"><ID>s3drive</ID><DisplayName>s3drive</DisplayName></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>`)
 	case hasQuery(o.r, "policy"):
-		writeS3Error(o.w, o.r, o.reqID, "NoSuchBucketPolicy", "The bucket policy does not exist", http.StatusNotFound)
+		switch o.r.Method {
+		case http.MethodPut:
+			o.w.WriteHeader(http.StatusNoContent)
+		case http.MethodDelete:
+			o.w.WriteHeader(http.StatusNoContent)
+		default:
+			writeS3Error(o.w, o.r, o.reqID, "NoSuchBucketPolicy", "The bucket policy does not exist", http.StatusNotFound)
+		}
 	case hasQuery(o.r, "cors"):
 		writeRawXML(o.w, http.StatusOK, `<CORSConfiguration xmlns="`+xmlNS+`"/>`)
 	case hasQuery(o.r, "lifecycle"):
@@ -642,6 +973,9 @@ func (s *Server) fail(o *opCtx, err error) {
 }
 
 func mapError(err error) (code, message string, status int) {
+	if errors.Is(err, errPayloadHashMismatch) {
+		return "XAmzContentSHA256Mismatch", errPayloadHashMismatch.Error(), http.StatusBadRequest
+	}
 	var de *drive.Error
 	if errors.As(err, &de) {
 		return de.Code, de.Message, de.Status
@@ -655,6 +989,8 @@ func mapError(err error) (code, message string, status int) {
 			return "NoSuchKey", "the specified key does not exist", http.StatusNotFound
 		case ae.Status == http.StatusForbidden:
 			return "AccessDenied", ae.Message, http.StatusForbidden
+		case ae.Status == http.StatusRequestedRangeNotSatisfiable:
+			return "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable
 		case ae.Status == http.StatusTooManyRequests:
 			return "SlowDown", "Google Drive is rate limiting requests, please retry", http.StatusServiceUnavailable
 		default:
@@ -671,13 +1007,19 @@ func mapError(err error) (code, message string, status int) {
 }
 
 func splitPath(r *http.Request) (bucket, key string) {
-	path := strings.TrimPrefix(r.URL.Path, "/")
+	path := strings.TrimPrefix(r.URL.EscapedPath(), "/")
 	if path == "" {
 		return "", ""
 	}
 	bucket, key, ok := strings.Cut(path, "/")
+	if b, err := url.PathUnescape(bucket); err == nil {
+		bucket = b
+	}
 	if !ok {
 		return bucket, ""
+	}
+	if k, err := url.PathUnescape(key); err == nil {
+		key = k
 	}
 	return bucket, key
 }

@@ -28,7 +28,7 @@ type listBucketResult struct {
 	NextMarker            string         `xml:"NextMarker,omitempty"`
 	Delimiter             string         `xml:"Delimiter,omitempty"`
 	MaxKeys               int            `xml:"MaxKeys"`
-	KeyCount              int            `xml:"KeyCount,omitempty"`
+	KeyCount              *int           `xml:"KeyCount,omitempty"`
 	IsTruncated           bool           `xml:"IsTruncated"`
 	ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
 	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
@@ -44,6 +44,7 @@ type listObject struct {
 	ETag         string `xml:"ETag"`
 	Size         int64  `xml:"Size"`
 	StorageClass string `xml:"StorageClass"`
+	Owner        *owner `xml:"Owner,omitempty"`
 }
 
 type commonPrefix struct {
@@ -75,6 +76,12 @@ type locationConstraint struct {
 	XMLName xml.Name `xml:"LocationConstraint"`
 	Xmlns   string   `xml:"xmlns,attr"`
 	Value   string   `xml:",chardata"`
+}
+
+type copyPartResult struct {
+	XMLName      xml.Name `xml:"CopyPartResult"`
+	LastModified string   `xml:"LastModified"`
+	ETag         string   `xml:"ETag"`
 }
 
 type copyObjectResult struct {
@@ -165,13 +172,17 @@ type listMultipartUploadsResult struct {
 	XMLName            xml.Name         `xml:"ListMultipartUploadsResult"`
 	Xmlns              string           `xml:"xmlns,attr"`
 	Bucket             string           `xml:"Bucket"`
+	Prefix             string           `xml:"Prefix"`
+	Delimiter          string           `xml:"Delimiter,omitempty"`
 	KeyMarker          string           `xml:"KeyMarker"`
 	UploadIDMarker     string           `xml:"UploadIdMarker"`
 	NextKeyMarker      string           `xml:"NextKeyMarker"`
 	NextUploadIDMarker string           `xml:"NextUploadIdMarker"`
 	MaxUploads         int              `xml:"MaxUploads"`
 	IsTruncated        bool             `xml:"IsTruncated"`
+	EncodingType       string           `xml:"EncodingType,omitempty"`
 	Uploads            []multipartEntry `xml:"Upload"`
+	CommonPrefixes     []commonPrefix   `xml:"CommonPrefixes"`
 }
 
 type multipartEntry struct {
