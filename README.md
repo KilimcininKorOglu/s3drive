@@ -13,10 +13,11 @@
 ### What it does
 
 - **S3 API** on `:9000` (path-style): buckets, `ListObjectsV2` with prefix/delimiter/pagination, Put/Get/Head/Delete/Copy, Range and conditional GET, multipart uploads, presigned URLs, `DeleteObjects`, SigV4 header and query authentication.
-- **Web console** on `:8080`: dashboard and quota, file browser/upload/download, bucket management, account connections, S3 access keys, OAuth settings.
-- **Google Drive backend**: each bucket is a Drive folder under My Drive. `/` in an object key becomes a nested folder.
+- **Web console** on `:8080`: dashboard and quota, file browser with search, rename/move/copy/preview, drag-and-drop and folder upload, multipart-backed pause/resume, bucket usage, account nicknames, access-key policies, presigned-link generator, audit log with CSV export, users/roles and OAuth settings.
+- **Google Drive backend**: each bucket is a folder inside a private, marked `s3drive/` namespace under My Drive. `/` in an object key becomes a nested folder. Pre-existing unmarked folders are never adopted.
 - **Multiple Google accounts**: pin a bucket to one account, and/or use the virtual **pool** bucket that merges every connected account. Pool uploads go to the account with the most free space; object→account mappings are kept in SQLite.
-- **Secure by default**: encrypted refresh tokens (AES-256-GCM), S3 credentials encrypted at rest, optional console password, CSRF protection, signed session cookies, no external service dependencies.
+- **Access-key policies**: read-only or read/write, optional bucket and prefix restriction, optional expiry, and per-request audit attribution.
+- **Secure by default**: encrypted refresh tokens (AES-256-GCM), S3 credentials encrypted at rest, console users with admin/viewer roles, login rate limiting, `Cache-Control: no-store` on secret pages, CSRF protection, signed session cookies, no external service dependencies.
 - **Single binary + Docker**: HTML/CSS/JS and htmx are embedded with `go:embed`. SQLite is cgo-free (`modernc.org/sqlite`).
 
 ### How it works
@@ -89,8 +90,8 @@ The OAuth flow uses PKCE (S256), `access_type=offline`, and `prompt=consent`; on
 ### First steps in the console
 
 1. **Connect an account** (Accounts).
-2. **Create a bucket** (Buckets) and choose the account that owns it. Buckets map to a Drive folder at the root of My Drive.
-3. **Create an access key** (Access keys). The secret is shown once — copy it immediately.
+2. **Create a bucket** (Buckets) and choose the account that owns it. Buckets map to folders inside the private `s3drive/` namespace. The namespace name is editable in Settings before any bucket exists.
+3. **Create an access key** (Access keys). Choose read/write or read-only, optionally restrict it to one bucket and key prefix, and set an expiry. The secret is shown once — copy it immediately.
 4. Point any S3 client at `http://your-host:9000` with region `us-east-1` and the key pair.
 
 Your browser may show the S3 endpoint as `localhost:9000`; set `S3DRIVE_PUBLIC_S3_URL` if clients reach it through a different hostname or TLS proxy.
@@ -141,7 +142,16 @@ Bucket names must be 3–63 characters, lowercase letters/numbers/dots/hyphens, 
 | `S3DRIVE_UI_PASSWORD`          | empty                       | Console password; if empty the console is open    |
 | `S3DRIVE_SPOOL_DIR`            | `$DATA_DIR/tmp`             | Multipart/staging directory                       |
 | `S3DRIVE_LOG_LEVEL`            | `info`                      | `debug`, `info`, `warn`, `error`                  |
-| `S3DRIVE_TRUST_PROXY`          | `false`                     | Trust `X-Forwarded-Proto` for secure cookies/URLs |
+| `S3DRIVE_TRUST_PROXY`          | `false`                     | Trust `X-Forwarded-*` from a reverse proxy        |
+| `S3DRIVE_MAX_OBJECT_BYTES`     | `5 TiB`                     | Reject larger single objects                      |
+| `S3DRIVE_DAILY_UPLOAD_BYTES`   | `750 GiB`                   | Per-account daily upload budget                   |
+| `S3DRIVE_MAX_CONCURRENT_UPLOADS` | `4`                       | Concurrent uploads per Drive account              |
+| `S3DRIVE_DISK_RESERVE_BYTES`   | `1 GiB`                     | Free spool disk that must remain available        |
+| `S3DRIVE_MAX_UI_BODY_BYTES`    | `1 GiB`                     | Largest console request body                      |
+| `S3DRIVE_SHUTDOWN_TIMEOUT`     | `5m`                        | Graceful drain window for in-flight uploads       |
+| `S3DRIVE_LOGIN_MAX_FAILURES`   | `5`                         | Failed logins before an IP is locked              |
+| `S3DRIVE_LOGIN_WINDOW`         | `15m`                       | Failure counting window                           |
+| `S3DRIVE_LOGIN_LOCKOUT`        | `15m`                       | Lockout duration                                  |
 | `S3DRIVE_GOOGLE_CLIENT_ID`     | empty                       | Optional OAuth client override (env wins)         |
 | `S3DRIVE_GOOGLE_CLIENT_SECRET` | empty                       | Optional OAuth secret override                    |
 
@@ -166,7 +176,9 @@ Run s3drive behind Caddy, nginx, or Traefik. Things to configure:
 - Sessions are HMAC-signed, `HttpOnly`, `SameSite=Lax`, and invalidated on restart.
 - State-changing console requests require a CSRF cookie/token pair; `POST /login` and `/lang` are covered too.
 - Public bucket mode allows anonymous **GET/HEAD of objects** only. Bucket listings, writes, deletes, and bucket-level HEAD still require a signature.
-- The console does not support multi-user roles: every signed-in browser has full control.
+- Console users have `admin` (full control) or `viewer` (read-only) roles. The environment password is a break-glass admin login and should be rotated or removed once DB users exist.
+- Repeated failed logins are rate-limited per client IP. Secret pages and responses are sent with `Cache-Control: no-store`.
+- S3 access keys can be scoped to a bucket/prefix, made read-only, and given an expiry. Each request is attributed to its key in the audit log.
 - Give s3drive its own Google OAuth client and treat the Drive accounts as the security boundary.
 
 ### S3 API support
@@ -175,10 +187,12 @@ Implemented:
 
 - `ListBuckets`, `CreateBucket`, `HeadBucket`, `DeleteBucket` (bucket must be empty)
 - `ListObjects`, `ListObjectsV2` (prefix, delimiter, max-keys, marker/continuation-token, start-after, encoding-type=url)
-- `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `DeleteObjects`, `CopyObject`
-- `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`
-- Multipart: create, upload part, list parts, list uploads, complete, abort
-- SigV4 authorization header and presigned query URLs
+- `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `DeleteObjects` (with `Content-MD5`), `CopyObject`
+- `Range`/`If-Range` (including 416 and HEAD ranges), `If-Match`, `If-None-Match` (including `*`), `If-Modified-Since`, `If-Unmodified-Since`
+- Multipart: create, upload part, `UploadPartCopy`, list parts/uploads with pagination, complete, abort, standard multipart ETags, abandoned-upload cleanup
+- User metadata (`x-amz-meta-*`), storage class, ACL, checksum headers and `aws-chunked` trailer checksums
+- Listings with `max-keys=0`, `fetch-owner`, custom delimiters, empty/leading key segments and native Google Docs filtering/export
+- SigV4 authorization header and presigned query URLs with Unicode, `+` and `%2F` handling
 - `GetBucketLocation`, `GetBucketVersioning`, `GetBucketAcl`, `GetBucketCors`, `GetBucketTagging` and similar read-only stubs used by SDK probes
 - Path-style `/{bucket}/{key}` addressing
 
@@ -194,7 +208,7 @@ Drive is not S3. Expect these differences:
 - **No versions or undelete**: overwrites replace content; deletes are permanent (`files.delete`, not trash) to release quota.
 - **Multipart staging**: parts are stored on local disk and concatenated into one temp file at completion, then uploaded. Completing a 100 GB multipart needs ~100 GB of free spool space.
 - **ETags**: for reads, the Drive MD5 when available, otherwise the file ID. Multipart ETags use the standard `md5-of-part-md5s-N` format for the completed object, but Drive may report its own MD5 on later reads.
-- **Metadata**: only content type is kept; S3 user metadata, storage classes, tags, and ACLs are not preserved.
+- **Metadata**: S3 user metadata, storage class, checksum values and content type are stored in SQLite and returned on reads/copies. Tags and mutable ACLs are still not persisted.
 - **Performance**: each object maps to a Drive API call. Listing is folder traversal, not a single indexed query. Latency is bounded by Drive, not by s3drive.
 - **Quota accounting**: Drive counts trashed files and all files in the account, not just s3drive data.
 - **Pool consistency**: the object index is best-effort. Files added to a pool folder outside s3drive are discovered by scanning; duplicate keys across accounts are deduplicated but not merged.
@@ -210,6 +224,12 @@ make vet        # go vet ./...
 make fmt        # gofmt
 make docker     # docker build -t s3drive .
 ```
+
+The repository includes a GitHub Actions workflow that runs `gofmt`, `go vet`, `go test` and a static build.
+
+### License
+
+MIT — see [LICENSE](LICENSE).
 
 Project layout:
 
@@ -417,7 +437,7 @@ Drive bir S3 değildir. Bu farkları bekleyin:
 - **Sürüm/geri alma yok**: üzerine yazma içeriği değiştirir; silmeler kalıcıdır (kota açılsın diye çöp kutusu değil `files.delete` kullanılır).
 - **Multipart geçici alanı**: parçalar yerel diskte tutulur, tamamlamada tek geçici dosyada birleştirilir ve yüklenir. 100 GB'lık multipart tamamlama ~100 GB boş spool alanı ister.
 - **ETag**: okumalarda Drive MD5'i varsa o, yoksa dosya kimliği. Multipart ETag tamamlanan nesne için standart `md5-of-part-md5s-N` biçimini kullanır; ancak Drive sonraki okumalarda kendi MD5'ini bildirebilir.
-- **Meta veri**: yalnızca content type korunur; S3 kullanıcı meta verisi, storage class, tag ve ACL'ler saklanmaz.
+- **Meta veri**: S3 kullanıcı meta verisi, storage class, checksum değerleri ve content type SQLite'ta saklanır ve okuma/kopyalamada döner. Tag ve değiştirilebilir ACL'ler hâlâ saklanmaz.
 - **Performans**: her nesne bir Drive API çağrısıdır. Listeleme tek indeksli sorgu değil, klasör gezintisidir. Gecikme s3drive'a değil Drive'a bağlıdır.
 - **Kota muhasebesi**: Drive, yalnızca s3drive verisini değil hesaptaki tüm dosyaları ve çöptekileri sayar.
 - **Pool tutarlılığı**: nesne indeksi en iyi çabadır. s3drive dışında pool klasörüne eklenen dosyalar tarama ile bulunur; hesaplar arası aynı anahtarlar tekilleştirilir ama birleştirilmez.
@@ -449,4 +469,8 @@ web/                  gömülü şablonlar ve statik dosyalar
 helper-projects/      tasarım sırasında kullanılan referans projeler
 ```
 
-Henüz test paketi yok; mevcut kontroller `go vet ./...` ve gerçek bir Drive hesabına karşı elle duman testidir. Katkı ve hata bildirimleri memnuniyetle karşılanır.
+`go test ./...`, `go vet ./...` ve GitHub Actions CI pakete dahildir. Gerçek Drive uçtan uca testleri için kendi OAuth istemciniz ve hesabınız gerekir. Katkı ve hata bildirimleri memnuniyetle karşılanır.
+
+### Lisans
+
+MIT — bkz. [LICENSE](LICENSE).
