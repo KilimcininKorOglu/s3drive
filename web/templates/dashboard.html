@@ -1,5 +1,5 @@
 {{define "content"}}
-{{if not .OAuthReady}}
+{{if and (not .OAuthReady) .IsAdmin}}
 <div class="flash warn">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2.7 20h18.6z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
   <div class="grow">
@@ -24,10 +24,12 @@
     </div>
     <h3>{{ t "onboard.title" }}</h3>
     <p>{{ t "onboard.body" }}</p>
-    {{if .OAuthReady}}
-      <a class="btn btn-primary" href="/oauth/start">{{ t "accounts.connect" }}</a>
-    {{else}}
-      <a class="btn btn-primary" href="/settings">{{ t "setup.open_settings" }}</a>
+    {{if .IsAdmin}}
+      {{if .OAuthReady}}
+        <a class="btn btn-primary" href="/oauth/start">{{ t "accounts.connect" }}</a>
+      {{else}}
+        <a class="btn btn-primary" href="/settings">{{ t "setup.open_settings" }}</a>
+      {{end}}
     {{end}}
   </div>
 </div>
@@ -68,7 +70,7 @@
   </div>
 </div>
 
-{{if not .HasKeys}}
+{{if and (not .HasKeys) .IsAdmin}}
 <div class="flash warn mt-2">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="3.5"/><path d="m10 13 8.5-8.5"/></svg>
   <div class="grow">
@@ -108,7 +110,7 @@
         <a class="btn" href="/files">{{ t "nav.files" }}</a>
         <a class="btn" href="/buckets">{{ t "nav.buckets" }}</a>
         <a class="btn" href="/keys">{{ t "nav.keys" }}</a>
-        <a class="btn" href="/settings">{{ t "nav.settings" }}</a>
+        {{if .IsAdmin}}<a class="btn" href="/settings">{{ t "nav.settings" }}</a>{{end}}
       </div>
     </div>
   </div>

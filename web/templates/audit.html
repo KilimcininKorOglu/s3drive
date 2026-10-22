@@ -1,0 +1,89 @@
+{{define "content"}}
+<div class="stack">
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "audit.filter_title" }}</h2><p>{{ t "audit.filter_hint" }}</p></div>
+      <a class="btn btn-sm" href="{{ .ExportURL }}">{{ t "audit.export" }}</a>
+    </div>
+    <div class="card-body">
+      <form method="get" action="/audit" class="form">
+        <div class="grid grid-4">
+          <div class="field">
+            <label for="audit-op">{{ t "audit.op" }}</label>
+            <input class="input" id="audit-op" name="op" value="{{ .Filter.Op }}" placeholder="PutObject" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="audit-bucket">{{ t "audit.bucket" }}</label>
+            <input class="input" id="audit-bucket" name="bucket" value="{{ .Filter.Bucket }}" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="audit-key">{{ t "audit.key" }}</label>
+            <input class="input" id="audit-key" name="key" value="{{ .Filter.Key }}" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="audit-access">{{ t "audit.access_key" }}</label>
+            <input class="input" id="audit-access" name="access_key" value="{{ .Filter.AccessKey }}" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="audit-status">{{ t "audit.status" }}</label>
+            <select class="input" id="audit-status" name="status">
+              <option value="">{{ t "audit.status_all" }}</option>
+              <option value="ok" {{if eq .Filter.Status "ok"}}selected{{end}}>{{ t "audit.status_ok" }}</option>
+              <option value="error" {{if eq .Filter.Status "error"}}selected{{end}}>{{ t "audit.status_error" }}</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="audit-since">{{ t "audit.since" }}</label>
+            <input class="input" id="audit-since" name="since" type="date" value="{{ .SinceText }}">
+          </div>
+          <div class="field">
+            <label for="audit-until">{{ t "audit.until" }}</label>
+            <input class="input" id="audit-until" name="until" type="date" value="{{ .UntilText }}">
+          </div>
+          <div class="field" style="justify-content:flex-end">
+            <button class="btn btn-primary" type="submit">{{ t "audit.apply" }}</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "audit.title" }}</h2><p>{{ t "audit.subtitle" }}</p></div>
+      <span class="badge">{{ .Total }} {{ t "audit.events" }}</span>
+    </div>
+    {{if .Events}}
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr><th>{{ t "audit.when" }}</th><th>{{ t "audit.op" }}</th><th>{{ t "audit.target" }}</th><th>{{ t "audit.access_key" }}</th><th>{{ t "common.status" }}</th><th class="hide-sm">{{ t "audit.size" }}</th><th class="hide-sm">{{ t "audit.duration" }}</th></tr>
+        </thead>
+        <tbody>
+          {{range .Events}}
+          <tr>
+            <td class="muted small nowrap">{{ .When }}</td>
+            <td><span class="badge">{{ .Op }}</span></td>
+            <td class="small"><span class="mono">{{ .Bucket }}{{if .Key}}/{{ .Key }}{{end}}</span></td>
+            <td class="mono small">{{ if .AccessKey }}{{ .AccessKey }}{{ else }}<span class="faint">—</span>{{ end }}</td>
+            <td>{{ if .StatusOK }}<span class="badge ok">{{ .Status }}</span>{{ else }}<span class="badge danger">{{ .Status }}</span>{{ end }}</td>
+            <td class="hide-sm muted small nowrap">{{ bytes .Size }}</td>
+            <td class="hide-sm muted small nowrap">{{ .MS }} ms</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    <div class="card-foot row-between">
+      <span class="small faint">{{ t "audit.page" }} {{ .Page }} / {{ .Pages }}</span>
+      <div class="row">
+        {{if .HasPrev}}<a class="btn btn-sm" href="{{ .PrevURL }}">{{ t "common.previous" }}</a>{{end}}
+        {{if .HasNext}}<a class="btn btn-sm" href="{{ .NextURL }}">{{ t "common.next" }}</a>{{end}}
+      </div>
+    </div>
+    {{else}}
+    <div class="empty"><h3>{{ t "audit.empty" }}</h3><p>{{ t "audit.empty_hint" }}</p></div>
+    {{end}}
+  </div>
+</div>
+{{end}}

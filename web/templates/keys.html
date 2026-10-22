@@ -18,21 +18,95 @@
     </div>
   </div>
 
+  {{if .IsAdmin}}
   <div class="card">
     <div class="card-head">
       <div><h2>{{ t "keys.create_title" }}</h2><p>{{ t "keys.create_hint" }}</p></div>
     </div>
     <div class="card-body">
-      <form method="post" action="/keys/create" class="inline-form">
+      <form method="post" action="/keys/create" class="form">
         <input type="hidden" name="csrf" value="{{ .CSRF }}">
-        <div class="field grow" style="max-width:340px">
-          <label for="key-label">{{ t "keys.label" }}</label>
-          <input class="input" id="key-label" name="label" placeholder="{{ t "keys.label_placeholder" }}" autocomplete="off">
+        <div class="grid grid-4">
+          <div class="field">
+            <label for="key-label">{{ t "keys.label" }}</label>
+            <input class="input" id="key-label" name="label" placeholder="{{ t "keys.label_placeholder" }}" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="key-permission">{{ t "keys.permission" }}</label>
+            <select class="input" id="key-permission" name="permission">
+              <option value="rw">{{ t "keys.permission_rw" }}</option>
+              <option value="ro">{{ t "keys.permission_ro" }}</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="key-bucket">{{ t "keys.bucket" }}</label>
+            <select class="input" id="key-bucket" name="bucket">
+              <option value="">{{ t "keys.all_buckets" }}</option>
+              {{range .Buckets}}<option value="{{ . }}">{{ . }}</option>{{end}}
+            </select>
+          </div>
+          <div class="field">
+            <label for="key-prefix">{{ t "keys.prefix" }}</label>
+            <input class="input" id="key-prefix" name="prefix" placeholder="photos/" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="key-expires">{{ t "keys.expires_days" }}</label>
+            <input class="input" id="key-expires" name="expires_days" type="number" min="0" max="3650" placeholder="0">
+          </div>
         </div>
-        <button class="btn btn-primary" type="submit">{{ t "keys.create" }}</button>
+        <div class="row"><button class="btn btn-primary" type="submit">{{ t "keys.create" }}</button></div>
       </form>
     </div>
   </div>
+  {{end}}
+
+  {{if .IsAdmin}}
+  <div class="card">
+    <div class="card-head">
+      <div><h2>{{ t "keys.presign_title" }}</h2><p>{{ t "keys.presign_hint" }}</p></div>
+    </div>
+    <div class="card-body">
+      {{if .Keys}}
+      <form method="post" action="/keys/presign" class="form">
+        <input type="hidden" name="csrf" value="{{ .CSRF }}">
+        <div class="grid grid-4">
+          <div class="field">
+            <label for="presign-key">{{ t "keys.access_key" }}</label>
+            <select class="input" id="presign-key" name="access_key" required>
+              {{range .Keys}}<option value="{{ .AccessKey }}">{{ .AccessKey }}{{if .Label}} · {{ .Label }}{{end}}</option>{{end}}
+            </select>
+          </div>
+          <div class="field">
+            <label for="presign-bucket">{{ t "keys.bucket" }}</label>
+            <select class="input" id="presign-bucket" name="bucket" required>
+              {{range .Buckets}}<option value="{{ . }}">{{ . }}</option>{{end}}
+            </select>
+          </div>
+          <div class="field">
+            <label for="presign-method">{{ t "keys.presign_method" }}</label>
+            <select class="input" id="presign-method" name="method">
+              <option value="GET">GET</option>
+              <option value="PUT">PUT</option>
+              <option value="HEAD">HEAD</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="presign-expires">{{ t "keys.presign_expires" }}</label>
+            <input class="input" id="presign-expires" name="expires_minutes" type="number" min="1" max="10080" value="15">
+          </div>
+          <div class="field" style="grid-column:1/-1">
+            <label for="presign-target">{{ t "keys.presign_target" }}</label>
+            <input class="input" id="presign-target" name="key" placeholder="photos/cat.jpg" autocomplete="off" required>
+          </div>
+        </div>
+        <div class="row"><button class="btn btn-primary" type="submit">{{ t "keys.presign_create" }}</button></div>
+      </form>
+      {{else}}
+      <p class="muted small" style="margin:0">{{ t "keys.presign_need_key" }}</p>
+      {{end}}
+    </div>
+  </div>
+  {{end}}
 
   <div class="card">
     <div class="card-head">
@@ -46,8 +120,11 @@
           <tr>
             <th>{{ t "keys.access_key" }}</th>
             <th class="hide-sm">{{ t "keys.label" }}</th>
+            <th class="hide-sm">{{ t "keys.permission" }}</th>
+            <th class="hide-sm">{{ t "keys.scope" }}</th>
             <th>{{ t "common.status" }}</th>
             <th class="hide-sm">{{ t "keys.created" }}</th>
+            <th class="hide-sm">{{ t "keys.expires" }}</th>
             <th class="hide-sm">{{ t "keys.last_used" }}</th>
             <th class="actions"><span class="sr-only">{{ t "files.actions" }}</span></th>
           </tr>
@@ -65,10 +142,14 @@
               </div>
             </td>
             <td class="hide-sm">{{ if .Label }}{{ .Label }}{{ else }}<span class="faint">—</span>{{ end }}</td>
+            <td class="hide-sm"><span class="badge">{{ if eq .Permission "ro" }}{{ t "keys.permission_ro" }}{{ else }}{{ t "keys.permission_rw" }}{{ end }}</span></td>
+            <td class="hide-sm muted small">{{ .Scope }}</td>
             <td>{{ if .Active }}<span class="badge ok">{{ t "keys.active" }}</span>{{ else }}<span class="badge danger">{{ t "keys.disabled" }}</span>{{ end }}</td>
             <td class="hide-sm muted small nowrap">{{ .Created }}</td>
+            <td class="hide-sm muted small nowrap">{{ if .Expires }}{{ .Expires }}{{ else }}—{{ end }}</td>
             <td class="hide-sm muted small nowrap">{{ if .LastUsed }}{{ .LastUsed }}{{ else }}{{ t "keys.never" }}{{ end }}</td>
             <td class="actions">
+              {{if $.IsAdmin}}
               <form method="post" action="/keys/toggle" style="display:inline">
                 <input type="hidden" name="csrf" value="{{ $.CSRF }}">
                 <input type="hidden" name="access_key" value="{{ .AccessKey }}">
@@ -82,6 +163,7 @@
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6.5 7l.8 12h9.4l.8-12"/></svg>
                 </button>
               </form>
+              {{end}}
             </td>
           </tr>
           {{end}}

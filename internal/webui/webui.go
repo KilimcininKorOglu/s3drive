@@ -2,6 +2,7 @@
 package webui
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,9 +14,11 @@ import (
 	"html/template"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -34,13 +37,21 @@ type Server struct {
 	Google *google.Client
 	Log    *slog.Logger
 
-	mux        *http.ServeMux
-	sessionKey []byte
-	templates  map[string]map[string]*template.Template
-	partials   map[string]*template.Template
+	mux           *http.ServeMux
+	sessionKey    []byte
+	templates     map[string]map[string]*template.Template
+	partials      map[string]*template.Template
+	loginMu       sync.Mutex
+	loginAttempts map[string]*loginAttempt
 }
 
-var pageNames = []string{"dashboard", "files", "buckets", "accounts", "keys", "settings", "login"}
+type loginAttempt struct {
+	failures    int
+	first       time.Time
+	lockedUntil time.Time
+}
+
+var pageNames = []string{"dashboard", "files", "buckets", "accounts", "keys", "audit", "settings", "login"}
 
 // New builds the console and parses every template for every language.
 func New(cfg config.Config, st *store.Store, svc *drive.Service, g *google.Client, log *slog.Logger) (*Server, error) {
@@ -50,9 +61,10 @@ func New(cfg config.Config, st *store.Store, svc *drive.Service, g *google.Clien
 	}
 	s := &Server{
 		Cfg: cfg, Store: st, Svc: svc, Google: g, Log: log, sessionKey: key,
-		mux:       http.NewServeMux(),
-		templates: map[string]map[string]*template.Template{},
-		partials:  map[string]*template.Template{},
+		mux:           http.NewServeMux(),
+		templates:     map[string]map[string]*template.Template{},
+		partials:      map[string]*template.Template{},
+		loginAttempts: map[string]*loginAttempt{},
 	}
 	if err := s.loadTemplates(); err != nil {
 		return nil, err
@@ -127,27 +139,45 @@ func (s *Server) routes() {
 	mux.HandleFunc("GET /files", s.files)
 	mux.HandleFunc("GET /files/download", s.download)
 	mux.HandleFunc("POST /files/upload", s.upload)
+	mux.HandleFunc("POST /files/upload-folder", s.uploadFolder)
+	mux.HandleFunc("POST /files/upload/init", s.uploadInit)
+	mux.HandleFunc("POST /files/upload/part", s.uploadPart)
+	mux.HandleFunc("POST /files/upload/complete", s.uploadComplete)
+	mux.HandleFunc("POST /files/upload/abort", s.uploadAbort)
 	mux.HandleFunc("POST /files/folder", s.createFolder)
 	mux.HandleFunc("POST /files/delete", s.deleteObject)
+	mux.HandleFunc("POST /files/bulk-delete", s.bulkDelete)
+	mux.HandleFunc("POST /files/rename", s.renameObject)
+	mux.HandleFunc("POST /files/move", s.moveObject)
+	mux.HandleFunc("POST /files/copy", s.copyObject)
 
 	mux.HandleFunc("GET /buckets", s.buckets)
 	mux.HandleFunc("POST /buckets/create", s.createBucket)
 	mux.HandleFunc("POST /buckets/delete", s.deleteBucket)
+	mux.HandleFunc("POST /buckets/rename", s.renameBucket)
 	mux.HandleFunc("POST /buckets/public", s.togglePublic)
 
 	mux.HandleFunc("GET /accounts", s.accounts)
 	mux.HandleFunc("POST /accounts/delete", s.deleteAccount)
+	mux.HandleFunc("POST /accounts/rename", s.renameAccount)
 	mux.HandleFunc("GET /oauth/start", s.oauthStart)
 	mux.HandleFunc("GET /oauth/callback", s.oauthCallback)
+
+	mux.HandleFunc("GET /audit", s.audit)
+	mux.HandleFunc("GET /audit/export.csv", s.auditExport)
 
 	mux.HandleFunc("GET /keys", s.keys)
 	mux.HandleFunc("POST /keys/create", s.createKey)
 	mux.HandleFunc("POST /keys/toggle", s.toggleKey)
 	mux.HandleFunc("POST /keys/delete", s.deleteKey)
+	mux.HandleFunc("POST /keys/presign", s.presign)
 
 	mux.HandleFunc("GET /settings", s.settings)
 	mux.HandleFunc("POST /settings/oauth", s.saveOAuthSettings)
 	mux.HandleFunc("POST /settings/server", s.saveServerSettings)
+	mux.HandleFunc("POST /settings/users/create", s.createUser)
+	mux.HandleFunc("POST /settings/users/delete", s.deleteUser)
+	mux.HandleFunc("POST /settings/users/password", s.changeUserPassword)
 
 	mux.HandleFunc("GET /login", s.loginPage)
 	mux.HandleFunc("POST /login", s.login)
@@ -171,8 +201,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Referrer-Policy", "same-origin")
 	h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 	h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'")
-
 	path := r.URL.Path
+	// Console pages can contain access-key secrets and account data. Static
+	// assets are not secret and may be cached normally.
+	if !strings.HasPrefix(path, "/static/") {
+		h.Set("Cache-Control", "no-store")
+	}
+
 	public := path == "/login" || path == "/lang" || path == "/healthz" ||
 		strings.HasPrefix(path, "/static/") || path == "/oauth/callback"
 
@@ -182,6 +217,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+		// Limit the body before CSRF parsing. Otherwise a multipart form is
+		// parsed (and spooled) before the size guard applies.
+		if s.Cfg.MaxUIBodyBytes > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, s.Cfg.MaxUIBodyBytes)
+		}
+		if path != "/login" && path != "/logout" && path != "/lang" && s.currentRole(r) != "admin" {
+			http.Error(w, "administrator role required", http.StatusForbidden)
+			return
+		}
 		if !s.checkCSRF(r) {
 			http.Error(w, "invalid or missing CSRF token", http.StatusForbidden)
 			return
@@ -190,31 +234,83 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-func (s *Server) isAuthed(r *http.Request) bool {
-	if s.Cfg.UIPassword == "" {
-		return true
-	}
-	c, err := r.Cookie("s3drive_session")
-	if err != nil {
-		return false
-	}
-	expiryPart, sigPart, ok := strings.Cut(c.Value, ".")
-	if !ok {
-		return false
-	}
-	mac := hmac.New(sha256.New, s.sessionKey)
-	mac.Write([]byte(expiryPart))
-	expected := hex.EncodeToString(mac.Sum(nil))
-	if subtle.ConstantTimeCompare([]byte(expected), []byte(sigPart)) != 1 {
-		return false
-	}
-	exp, err := strconv.ParseInt(expiryPart, 10, 64)
-	return err == nil && time.Now().Unix() < exp
+type sessionInfo struct {
+	UserID   string
+	Username string
+	Role     string
 }
 
-func (s *Server) setSession(w http.ResponseWriter, r *http.Request) {
+func (s *Server) session(r *http.Request) *sessionInfo {
+	c, err := r.Cookie("s3drive_session")
+	if err != nil {
+		return nil
+	}
+	payload, sigPart, ok := strings.Cut(c.Value, ".")
+	if !ok {
+		return nil
+	}
+	mac := hmac.New(sha256.New, s.sessionKey)
+	mac.Write([]byte(payload))
+	expected := hex.EncodeToString(mac.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(sigPart)) != 1 {
+		return nil
+	}
+	parts := strings.Split(payload, "|")
+	if len(parts) != 3 {
+		return nil
+	}
+	exp, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || time.Now().Unix() >= exp {
+		return nil
+	}
+	info := &sessionInfo{UserID: parts[1], Role: parts[2]}
+	if info.UserID == "env" {
+		// The env password is a break-glass admin. An open-mode session issued
+		// before the first database user must not survive once users exist.
+		if s.Cfg.UIPassword == "" {
+			if n, err := s.Store.CountUsers(r.Context()); err != nil || n > 0 {
+				return nil
+			}
+		}
+		info.Username = "admin"
+		return info
+	}
+	u, err := s.Store.GetUserByID(r.Context(), info.UserID)
+	if err != nil {
+		return nil
+	}
+	info.Username, info.Role = u.Username, u.Role
+	return info
+}
+
+func (s *Server) openMode() bool {
+	if s.Cfg.UIPassword != "" {
+		return false
+	}
+	n, err := s.Store.CountUsers(context.Background())
+	return err == nil && n == 0
+}
+
+func (s *Server) isAuthed(r *http.Request) bool {
+	if s.openMode() {
+		return true
+	}
+	return s.session(r) != nil
+}
+
+func (s *Server) currentRole(r *http.Request) string {
+	if s.openMode() {
+		return "admin"
+	}
+	if info := s.session(r); info != nil {
+		return info.Role
+	}
+	return ""
+}
+
+func (s *Server) setSession(w http.ResponseWriter, r *http.Request, userID, role string) {
 	expiry := time.Now().Add(s.Cfg.SessionTTL).Unix()
-	payload := strconv.FormatInt(expiry, 10)
+	payload := strconv.FormatInt(expiry, 10) + "|" + userID + "|" + role
 	mac := hmac.New(sha256.New, s.sessionKey)
 	mac.Write([]byte(payload))
 	http.SetCookie(w, &http.Cookie{
@@ -266,11 +362,65 @@ func (s *Server) checkCSRF(r *http.Request) bool {
 	if err != nil || c.Value == "" {
 		return false
 	}
-	token := r.FormValue("csrf")
+	token := r.Header.Get("X-CSRF-Token")
 	if token == "" {
-		token = r.Header.Get("X-CSRF-Token")
+		token = r.FormValue("csrf")
 	}
 	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(token)) == 1
+}
+
+func (s *Server) clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if s.Cfg.TrustProxy {
+		if v := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); v != "" {
+			host = v
+		}
+	}
+	return host
+}
+
+func (s *Server) loginAllowed(ip string) (bool, time.Duration) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	a := s.loginAttempts[ip]
+	if a == nil {
+		return true, 0
+	}
+	if time.Now().Before(a.lockedUntil) {
+		return false, time.Until(a.lockedUntil)
+	}
+	return true, 0
+}
+
+func (s *Server) recordLoginFailure(ip string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	now := time.Now()
+	if len(s.loginAttempts) > 4096 {
+		for addr, a := range s.loginAttempts {
+			if now.After(a.lockedUntil) && now.Sub(a.first) > s.Cfg.LoginWindow {
+				delete(s.loginAttempts, addr)
+			}
+		}
+	}
+	a := s.loginAttempts[ip]
+	if a == nil || now.Sub(a.first) > s.Cfg.LoginWindow {
+		a = &loginAttempt{first: now}
+		s.loginAttempts[ip] = a
+	}
+	a.failures++
+	if s.Cfg.LoginMaxFailures > 0 && a.failures >= s.Cfg.LoginMaxFailures {
+		a.lockedUntil = now.Add(s.Cfg.LoginLockout)
+	}
+}
+
+func (s *Server) recordLoginSuccess(ip string) {
+	s.loginMu.Lock()
+	delete(s.loginAttempts, ip)
+	s.loginMu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +445,10 @@ type baseData struct {
 	AuthPage    bool
 	Health      string
 	HealthWarn  bool
+	UserName    string
+	UserRole    string
+	IsAdmin     bool
+	UsersExist  bool
 }
 
 func (s *Server) base(w http.ResponseWriter, r *http.Request, title, subtitle, nav string, withFlash bool) baseData {
@@ -308,6 +462,15 @@ func (s *Server) base(w http.ResponseWriter, r *http.Request, title, subtitle, n
 		Version:     config.Version,
 		CSRF:        s.csrfToken(w, r),
 		PasswordSet: s.Cfg.UIPassword != "",
+	}
+	if info := s.session(r); info != nil {
+		b.UserName, b.UserRole, b.IsAdmin = info.Username, info.Role, info.Role == "admin"
+	}
+	if s.openMode() {
+		b.UserName, b.UserRole, b.IsAdmin = "admin", "admin", true
+	}
+	if n, err := s.Store.CountUsers(r.Context()); err == nil {
+		b.UsersExist = n > 0
 	}
 	if withFlash {
 		b.Flash = s.popFlash(w, r)

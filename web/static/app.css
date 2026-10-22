@@ -309,8 +309,10 @@ img { max-width: 100%; }
 .card-head p { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
 .card-body { padding: 18px; }
 .card-body.tight { padding: 10px 12px; }
-.stack { display: flex; flex-direction: column; gap: 18px; }
-.grid { display: grid; gap: 16px; }
+.stack { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.stack > * { min-width: 0; max-width: 100%; }
+.grid { display: grid; gap: 16px; min-width: 0; }
+.grid > * { min-width: 0; }
 .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -341,7 +343,7 @@ img { max-width: 100%; }
 .progress.danger > span { background: linear-gradient(90deg, #f87171, #dc2626); }
 
 /* Tables ------------------------------------------------------------------ */
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; max-width: 100%; }
 table.table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .table th {
   text-align: left;
@@ -360,7 +362,8 @@ table.table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .table tbody tr { transition: background .12s; }
 .table tbody tr:hover { background: var(--surface-2); }
 .table .num { text-align: right; font-variant-numeric: tabular-nums; }
-.table .actions { text-align: right; white-space: nowrap; }
+.table .actions { text-align: right; }
+.table .actions > * { vertical-align: middle; }
 .table .actions form { display: inline; }
 .cell-name { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .cell-name .name { font-weight: 550; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -587,13 +590,42 @@ details.help .help-body { padding-top: 10px; color: var(--muted); font-size: 12.
   .nav-item svg { width: 18px; height: 18px; }
   .topbar { padding: 18px 18px 12px; }
   .content { padding: 4px 18px 44px; }
-  .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+  .grid-2, .grid-3, .grid-4 { grid-template-columns: minmax(0, 1fr); }
   .auth-shell { align-items: start; padding-top: 8vh; }
 }
 @media (max-width: 560px) {
   .topbar { flex-direction: column; gap: 12px; }
+  .card-head { flex-wrap: wrap; }
   .topbar-actions { justify-content: flex-start; }
   .table th, .table td { padding: 9px 10px; }
   .table .hide-sm { display: none; }
   .stat-value { font-size: 23px; }
 }
+
+/* Preview, selection and drag/drop --------------------------------------- */
+.linklike { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-align: left; }
+.table .check { width: 34px; padding-right: 0; }
+.table .check input { width: 15px; height: 15px; accent-color: var(--accent); }
+#file-panel.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; border-radius: 14px; }
+.preview-dialog { width: min(1000px, 94vw); max-height: 88vh; padding: 0; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); box-shadow: var(--shadow-lg, var(--shadow)); }
+.preview-dialog::backdrop { background: rgba(2, 6, 23, .62); }
+.preview-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.preview-body { display: flex; align-items: center; justify-content: center; min-height: 240px; max-height: calc(88vh - 50px); overflow: auto; background: var(--surface-2); }
+.preview-body img, .preview-body iframe { display: block; max-width: 100%; border: 0; }
+.preview-body img { max-height: calc(88vh - 50px); }
+.preview-body iframe { width: 100%; height: min(72vh, 760px); background: #fff; }
+
+/* Accessibility ----------------------------------------------------------- */
+.skip-link {
+  position: fixed;
+  left: 12px;
+  top: -60px;
+  z-index: 100;
+  padding: 9px 14px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  transition: top .15s;
+}
+.skip-link:focus { top: 12px; }

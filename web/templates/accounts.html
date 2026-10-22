@@ -1,5 +1,5 @@
 {{define "content"}}
-{{if not .OAuthReady}}
+{{if and (not .OAuthReady) .IsAdmin}}
 <div class="flash warn">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2.7 20h18.6z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
   <div class="grow">{{ t "accounts.oauth_missing" }} <a href="/settings">{{ t "setup.open_settings" }}</a></div>
@@ -8,7 +8,7 @@
 
 <div class="row-between mb-2">
   <p class="muted small" style="margin:0;max-width:640px">{{ t "accounts.subtitle" }}</p>
-  {{if .OAuthReady}}<a class="btn btn-primary" href="/oauth/start">{{ t "accounts.connect" }}</a>{{end}}
+  {{if and .OAuthReady .IsAdmin}}<a class="btn btn-primary" href="/oauth/start">{{ t "accounts.connect" }}</a>{{end}}
 </div>
 
 {{if .Accounts}}
@@ -18,7 +18,13 @@
     <div class="account-head">
       <span class="avatar">{{if .Picture}}<img src="{{ .Picture }}" alt="">{{else}}{{ initial .Name }}{{end}}</span>
       <div class="grow" style="min-width:0">
-        <div class="account-name truncate">{{ .Name }}</div>
+        <div class="account-name truncate">{{ .Name }}
+          {{if $.IsAdmin}}
+          <button class="icon-btn" type="button" data-account-rename data-id="{{ .ID }}" data-name="{{ .Name }}" data-prompt-label="{{ t "accounts.rename_prompt" }}" title="{{ t "accounts.rename" }}" style="width:22px;height:22px;vertical-align:middle">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m4 20 5-1 10-10-4-4L5 15z"/><path d="m13.5 6.5 4 4"/></svg>
+          </button>
+          {{end}}
+        </div>
         <div class="account-mail truncate">{{ .Email }}</div>
       </div>
       {{if .NeedsReauth}}<span class="badge danger">{{ t "accounts.needs_reauth" }}</span>{{else}}<span class="badge ok"><span class="dot"></span>{{ t "accounts.connected" }}</span>{{end}}
@@ -41,12 +47,14 @@
     {{end}}
 
     <div class="row wrap">
+      {{if $.IsAdmin}}
       <a class="btn btn-sm" href="/oauth/start?account={{ urlquery .ID }}">{{ t "accounts.reauth" }}</a>
       <form method="post" action="/accounts/delete" onsubmit="return confirm('{{ t "accounts.remove_confirm" }}')">
         <input type="hidden" name="csrf" value="{{ $.CSRF }}">
         <input type="hidden" name="id" value="{{ .ID }}">
         <button class="btn btn-sm btn-danger" type="submit">{{ t "accounts.remove" }}</button>
       </form>
+      {{end}}
       <span class="small faint grow" style="text-align:right">{{ t "accounts.added" }} {{ .Created }}</span>
     </div>
   </div>
@@ -60,7 +68,7 @@
     </div>
     <h3>{{ t "accounts.empty" }}</h3>
     <p>{{ t "accounts.empty_hint" }}</p>
-    {{if .OAuthReady}}<a class="btn btn-primary" href="/oauth/start">{{ t "accounts.connect" }}</a>{{end}}
+    {{if and .OAuthReady .IsAdmin}}<a class="btn btn-primary" href="/oauth/start">{{ t "accounts.connect" }}</a>{{end}}
   </div>
 </div>
 {{end}}

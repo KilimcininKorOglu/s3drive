@@ -24,9 +24,15 @@
     <form method="post" action="/login" class="form">
       <input type="hidden" name="csrf" value="{{ .CSRF }}">
       <input type="hidden" name="next" value="{{ .Next }}">
+      {{if .UsersExist}}
+      <div class="field">
+        <label for="username">{{ t "login.username" }}</label>
+        <input class="input" id="username" name="username" type="text" autocomplete="username" required>
+      </div>
+      {{end}}
       <div class="field">
         <label for="password">{{ t "login.password" }}</label>
-        <input class="input" id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+        <input class="input" id="password" name="password" type="password" autocomplete="current-password" {{if not .UsersExist}}autofocus{{end}} required>
       </div>
       <button class="btn btn-primary" type="submit">{{ t "login.signin" }}</button>
     </form>

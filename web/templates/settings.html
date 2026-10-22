@@ -94,6 +94,11 @@
             </label>
             <span class="hint">{{ t "settings.pool_enabled_hint" }}</span>
           </div>
+          <div class="field">
+            <label for="namespace">{{ t "settings.namespace" }}</label>
+            <input class="input" id="namespace" name="namespace" value="{{ .Namespace }}" placeholder="s3drive" autocomplete="off">
+            <span class="hint">{{ t "settings.namespace_hint" }}</span>
+          </div>
         </div>
         <div class="row">
           <button class="btn btn-primary" type="submit">{{ t "common.save" }}</button>
@@ -103,8 +108,67 @@
   </div>
 
   <div class="card">
+    <div class="card-head"><div><h2>{{ t "settings.users_title" }}</h2><p>{{ t "settings.users_hint" }}</p></div></div>
+    <div class="card-body stack">
+      {{if .Users}}
+      <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>{{ t "settings.users_name" }}</th><th>{{ t "settings.users_role" }}</th><th>{{ t "settings.users_created" }}</th><th></th></tr></thead>
+        <tbody>
+          {{range .Users}}
+          <tr>
+            <td>{{ .Username }}{{if .IsSelf}} <span class="badge">{{ t "settings.users_you" }}</span>{{end}}</td>
+            <td><span class="badge">{{ .Role }}</span></td>
+            <td class="muted small">{{ .Created }}</td>
+            <td class="right">
+              <form method="post" action="/settings/users/password" class="row" style="justify-content:flex-end">
+                <input type="hidden" name="csrf" value="{{ $.CSRF }}">
+                <input type="hidden" name="id" value="{{ .ID }}">
+                <input class="input input-sm" name="password" type="password" aria-label="{{ t "settings.users_new_password" }}" placeholder="{{ t "settings.users_new_password" }}" minlength="8" required>
+                <button class="btn btn-ghost btn-sm" type="submit">{{ t "settings.users_password" }}</button>
+              </form>
+              {{if not .IsSelf}}
+              <form method="post" action="/settings/users/delete" onsubmit="return confirm('{{ t "settings.users_delete_confirm" }}')">
+                <input type="hidden" name="csrf" value="{{ $.CSRF }}">
+                <input type="hidden" name="id" value="{{ .ID }}">
+                <button class="btn btn-ghost btn-sm danger" type="submit">{{ t "common.delete" }}</button>
+              </form>
+              {{end}}
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      </div>
+      {{end}}
+      <form method="post" action="/settings/users/create" class="form">
+        <input type="hidden" name="csrf" value="{{ .CSRF }}">
+        <div class="grid grid-3">
+          <div class="field">
+            <label for="new-user">{{ t "settings.users_name" }}</label>
+            <input class="input" id="new-user" name="username" placeholder="admin" autocomplete="off" required>
+          </div>
+          <div class="field">
+            <label for="new-password">{{ t "login.password" }}</label>
+            <input class="input" id="new-password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+          </div>
+          <div class="field">
+            <label for="new-role">{{ t "settings.users_role" }}</label>
+            <select class="input" id="new-role" name="role">
+              <option value="viewer">viewer</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+        </div>
+        <div class="row"><button class="btn btn-primary" type="submit">{{ t "settings.users_create" }}</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card-head"><div><h2>{{ t "settings.env_title" }}</h2><p>{{ t "settings.env_hint" }}</p></div></div>
     <div class="card-body">
+      <div class="table-wrap">
       <table class="table">
         <tbody>
           <tr><td class="mono">S3DRIVE_UI_PASSWORD</td><td class="muted small">{{ t "settings.env_password" }}</td></tr>

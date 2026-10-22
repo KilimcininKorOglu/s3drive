@@ -1,5 +1,6 @@
 {{define "content"}}
 <div class="stack">
+  {{if .IsAdmin}}
   <div class="card">
     <div class="card-head">
       <div><h2>{{ t "buckets.create_title" }}</h2><p>{{ t "buckets.create_hint" }}</p></div>
@@ -30,11 +31,15 @@
       {{end}}
     </div>
   </div>
+  {{end}}
 
   <div class="card">
     <div class="card-head">
       <div><h2>{{ t "buckets.title" }}</h2><p>{{ t "buckets.subtitle" }}</p></div>
-      <span class="badge">{{ len .Buckets }} {{ t "buckets.count" }}</span>
+      <div class="row">
+        <a class="btn btn-sm" href="/buckets?usage=1">{{ t "buckets.usage_calc" }}</a>
+        <span class="badge">{{ len .Buckets }} {{ t "buckets.count" }}</span>
+      </div>
     </div>
     {{if .Buckets}}
     <div class="table-wrap">
@@ -44,6 +49,7 @@
             <th>{{ t "buckets.name" }}</th>
             <th class="hide-sm">{{ t "buckets.account" }}</th>
             <th class="hide-sm">{{ t "buckets.access" }}</th>
+            <th class="hide-sm">{{ t "buckets.usage" }}</th>
             <th class="hide-sm">{{ t "buckets.created" }}</th>
             <th class="actions"><span class="sr-only">{{ t "files.actions" }}</span></th>
           </tr>
@@ -58,14 +64,28 @@
                 {{if .Pool}}<span class="badge accent">{{ t "buckets.pool" }}</span>{{end}}
               </div>
             </td>
-            <td class="hide-sm muted small">{{ if .Pool }}{{ t "buckets.pool_account" }}{{ else }}{{ .AccountEmail }}{{ end }}</td>
+            <td class="hide-sm muted small">{{ if .Pool }}{{ t "buckets.pool_account" }}{{ else }}{{ if .AccountName }}{{ .AccountName }} · {{ end }}{{ .AccountEmail }}{{ end }}</td>
             <td class="hide-sm">
               {{if .Pool}}<span class="badge">{{ t "buckets.pool_access" }}</span>{{else if .PublicRead}}<span class="badge ok">{{ t "buckets.public" }}</span>{{else}}<span class="badge">{{ t "buckets.private" }}</span>{{end}}
+              {{if and .PublicRead .PublicURL}}
+              <div class="row mt-1" title="{{ t "buckets.public_url_hint" }}">
+                <span class="mono small truncate" style="max-width:210px">{{ .PublicURL }}/…</span>
+                <button class="icon-btn" type="button" data-copy="{{ .PublicURL }}/" data-copied-label="{{ t "common.copied" }}" title="{{ t "common.copy" }}" style="width:24px;height:24px">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+                </button>
+              </div>
+              {{end}}
+            </td>
+            <td class="hide-sm muted small nowrap">
+              {{if .UsageCalc}}{{ .Usage }}{{if .UsageCount}} · {{ .UsageCount }} {{ t "files.items" }}{{end}}{{if .UsageTrunc}}+{{end}}{{else if .Usage}}{{ .Usage }}{{else}}<a class="linklike" href="/buckets?usage=1">{{ t "buckets.usage_calc" }}</a>{{end}}
             </td>
             <td class="hide-sm muted small nowrap">{{ if .Pool }}—{{ else }}{{ .Created }}{{ end }}</td>
             <td class="actions">
               <a class="btn btn-sm" href="/files?bucket={{ urlquery .Name }}">{{ t "common.open" }}</a>
-              {{if not .Pool}}
+              {{if and (not .Pool) $.IsAdmin}}
+              <button class="icon-btn" type="button" data-bucket-rename data-name="{{ .Name }}" data-prompt-label="{{ t "buckets.rename_prompt" }}" title="{{ t "buckets.rename" }}">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m4 20 5-1 10-10-4-4L5 15z"/><path d="m13.5 6.5 4 4"/></svg>
+              </button>
               <form method="post" action="/buckets/public" style="display:inline">
                 <input type="hidden" name="csrf" value="{{ $.CSRF }}">
                 <input type="hidden" name="name" value="{{ .Name }}">
