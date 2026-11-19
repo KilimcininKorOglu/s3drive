@@ -501,6 +501,27 @@ func (s *Server) webUploadDir(id string) string {
 	return filepath.Join(s.Cfg.SpoolDir, "multipart", uploadSafeID(id))
 }
 
+// uploadPlan validates the declared object size (empty means unknown) and
+// picks a part size that keeps the browser upload within uiPartCount parts.
+// The client stores the part size so a resumed upload keeps the same
+// boundaries. msg and status describe a rejected size.
+func (s *Server) uploadPlan(raw string) (size, partSize int64, msg string, status int) {
+	if raw != "" {
+		var err error
+		if size, err = strconv.ParseInt(raw, 10, 64); err != nil || size < 0 {
+			return 0, 0, "invalid object size", http.StatusBadRequest
+		}
+	}
+	if s.Svc.MaxObjectBytes > 0 && size > s.Svc.MaxObjectBytes {
+		return 0, 0, "object exceeds the configured size limit", http.StatusRequestEntityTooLarge
+	}
+	partSize = max(uiMinPartSize, (size+uiPartCount-1)/uiPartCount)
+	if partSize > uiMaxPartSize {
+		return 0, 0, "object is too large for a browser upload", http.StatusRequestEntityTooLarge
+	}
+	return size, partSize, "", 0
+}
+
 func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
 	name := sanitizeName(filepath.Base(strings.TrimSpace(r.FormValue("name"))))
@@ -519,36 +540,12 @@ func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	size, _ := strconv.ParseInt(r.FormValue("size"), 10, 64)
-	if size < 0 {
-		http.Error(w, "invalid object size", http.StatusBadRequest)
+	size, partSize, msg, status := s.uploadPlan(r.FormValue("size"))
+	if msg != "" {
+		http.Error(w, msg, status)
 		return
 	}
-	if s.Svc.MaxObjectBytes > 0 && size > s.Svc.MaxObjectBytes {
-		http.Error(w, "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
-		return
-	}
-	// Keep the browser upload within 10,000 parts while staying efficient for
-	// ordinary files. The client stores this value so a resumed upload keeps
-	// using the same boundaries.
-	partSize := uiMinPartSize
-	if size > 0 {
-		needed := (size + uiPartCount - 1) / uiPartCount
-		if needed > partSize {
-			partSize = needed
-		}
-	}
-	if partSize > uiMaxPartSize {
-		http.Error(w, "object is too large for a browser upload", http.StatusRequestEntityTooLarge)
-		return
-	}
-	ct := strings.TrimSpace(r.FormValue("content_type"))
-	if ct == "" {
-		ct = mime.TypeByExtension(filepath.Ext(name))
-	}
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
+	ct := cmp.Or(strings.TrimSpace(r.FormValue("content_type")), mime.TypeByExtension(filepath.Ext(name)), "application/octet-stream")
 	id := store.NewID()
 	if err := s.Store.CreateUpload(r.Context(), &store.Upload{
 		ID: id, Bucket: bucket, Key: key, ContentType: ct, StorageClass: "STANDARD", Size: size,
@@ -577,49 +574,68 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := s.webUploadDir(up.ID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	tmpPath, n, ok := s.spoolWebPart(w, r, dir)
+	if !ok {
 		return
 	}
-	tmp, err := os.CreateTemp(dir, "part-*")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	body := http.MaxBytesReader(w, r.Body, uiMaxPartSize)
-	n, copyErr := io.Copy(tmp, body)
-	closeErr := tmp.Close()
-	if copyErr != nil || closeErr != nil {
-		s.removeTemp(tmp.Name())
-		if copyErr != nil {
-			http.Error(w, copyErr.Error(), http.StatusBadRequest)
-		} else {
-			http.Error(w, closeErr.Error(), http.StatusInternalServerError)
-		}
-		return
-	}
-	if total, err := stagedUploadBytes(dir, strconv.Itoa(part)); err != nil {
-		s.removeTemp(tmp.Name())
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	} else if total+n > s.Svc.MaxObjectBytes && s.Svc.MaxObjectBytes > 0 {
-		s.removeTemp(tmp.Name())
-		http.Error(w, "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
-		return
-	} else if up.Size > 0 && total+n > up.Size {
-		s.removeTemp(tmp.Name())
-		http.Error(w, "upload exceeds the declared object size", http.StatusRequestEntityTooLarge)
+	if msg, status := s.webPartRejected(dir, part, n, up.Size); msg != "" {
+		s.removeTemp(tmpPath)
+		http.Error(w, msg, status)
 		return
 	}
 	final := filepath.Join(dir, strconv.Itoa(part))
 	s.removeTemp(final)
-	if err := os.Rename(tmp.Name(), final); err != nil {
-		s.removeTemp(tmp.Name())
+	if err := os.Rename(tmpPath, final); err != nil {
+		s.removeTemp(tmpPath)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	_ = s.Store.TouchUpload(r.Context(), up.ID)
+	if err := s.Store.TouchUpload(r.Context(), up.ID); err != nil {
+		s.Log.Warn("touch console upload", "upload", up.ID, "err", err)
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// spoolWebPart writes at most uiMaxPartSize request bytes to a temp file in
+// dir. On failure it removes the file and writes the error response.
+func (s *Server) spoolWebPart(w http.ResponseWriter, r *http.Request, dir string) (string, int64, bool) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return "", 0, false
+	}
+	tmp, err := os.CreateTemp(dir, "part-*")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return "", 0, false
+	}
+	n, copyErr := io.Copy(tmp, http.MaxBytesReader(w, r.Body, uiMaxPartSize))
+	closeErr := tmp.Close()
+	switch {
+	case copyErr != nil:
+		s.removeTemp(tmp.Name())
+		http.Error(w, copyErr.Error(), http.StatusBadRequest)
+		return "", 0, false
+	case closeErr != nil:
+		s.removeTemp(tmp.Name())
+		http.Error(w, closeErr.Error(), http.StatusInternalServerError)
+		return "", 0, false
+	}
+	return tmp.Name(), n, true
+}
+
+// webPartRejected checks the other staged parts plus this one against the
+// object limit and the declared size.
+func (s *Server) webPartRejected(dir string, part int, n, declared int64) (string, int) {
+	total, err := stagedUploadBytes(dir, strconv.Itoa(part))
+	switch {
+	case err != nil:
+		return err.Error(), http.StatusInternalServerError
+	case s.Svc.MaxObjectBytes > 0 && total+n > s.Svc.MaxObjectBytes:
+		return "object exceeds the configured size limit", http.StatusRequestEntityTooLarge
+	case declared > 0 && total+n > declared:
+		return "upload exceeds the declared object size", http.StatusRequestEntityTooLarge
+	}
+	return "", 0
 }
 
 func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
@@ -630,87 +646,114 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 		s.filePartialStatus(w, r, r.FormValue("bucket"), normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: l.t("flash.upload_missing")}, http.StatusNotFound)
 		return
 	}
+	prefix := normalizePrefix(r.FormValue("prefix"))
+	fail := func(text string, status int) {
+		s.filePartialStatus(w, r, up.Bucket, prefix, &flashMessage{Kind: "error", Text: text}, status)
+	}
 	dir := s.webUploadDir(up.ID)
+	parts, missing := webUploadParts(dir)
+	if len(parts) == 0 {
+		fail(l.t("flash.upload_missing"), http.StatusNotFound)
+		return
+	}
+	if missing > 0 {
+		fail(l.t("flash.upload_incomplete", missing), http.StatusConflict)
+		return
+	}
+	combinedPath, total, sum, err := combineWebParts(dir, parts)
+	if combinedPath != "" {
+		defer s.removeTemp(combinedPath)
+	}
+	if err != nil {
+		fail(err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if key, status := s.combinedSizeRejected(total, up.Size); key != "" {
+		fail(l.t(key), status)
+		return
+	}
+	if _, err := s.Svc.PutFile(r.Context(), up.Bucket, up.Key, up.ContentType, combinedPath, total, sum); err != nil {
+		// Keep the upload record and staged parts so a transient Drive error can
+		// be retried by selecting the same file again.
+		fail(l.errorText(err), http.StatusBadGateway)
+		return
+	}
+	if err := s.Store.DeleteUpload(r.Context(), up.ID); err != nil {
+		s.Log.Warn("delete finished console upload", "upload", up.ID, "err", err)
+	}
+	s.removeDir(dir)
+	s.filePartial(w, r, up.Bucket, prefix, &flashMessage{Kind: "ok", Text: l.t("flash.uploaded", 1)})
+}
+
+// combinedSizeRejected checks the assembled size against the declared size
+// and the object limit; it returns a message key and status.
+func (s *Server) combinedSizeRejected(total, declared int64) (string, int) {
+	if declared > 0 && total != declared {
+		return "flash.upload_size", http.StatusConflict
+	}
+	if s.Svc.MaxObjectBytes > 0 && total > s.Svc.MaxObjectBytes {
+		return "err.too_large", http.StatusRequestEntityTooLarge
+	}
+	return "", 0
+}
+
+// webUploadParts returns the staged part files in part order. missing is the
+// first absent part number, or 0 when parts 1..n are all present. An
+// unreadable directory yields no parts.
+func webUploadParts(dir string) (paths []string, missing int) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: l.t("flash.upload_missing")}, http.StatusNotFound)
-		return
+		return nil, 0
 	}
-	type partFile struct {
-		n    int
-		path string
-	}
-	var parts []partFile
+	var nums []int
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		n, err := strconv.Atoi(entry.Name())
-		if err != nil {
-			continue
-		}
-		parts = append(parts, partFile{n: n, path: filepath.Join(dir, entry.Name())})
-	}
-	sort.Slice(parts, func(i, j int) bool { return parts[i].n < parts[j].n })
-	if len(parts) == 0 {
-		s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: l.t("flash.upload_missing")}, http.StatusNotFound)
-		return
-	}
-	for i, part := range parts {
-		if part.n != i+1 {
-			s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: l.t("flash.upload_incomplete", i+1)}, http.StatusConflict)
-			return
+		if n, err := strconv.Atoi(entry.Name()); err == nil && !entry.IsDir() {
+			nums = append(nums, n)
 		}
 	}
-	// Combine staged parts into one file, opening them one at a time so a
-	// large multipart upload cannot exhaust file descriptors.
+	sort.Ints(nums)
+	for i, n := range nums {
+		paths = append(paths, filepath.Join(dir, strconv.Itoa(n)))
+		if missing == 0 && n != i+1 {
+			missing = i + 1
+		}
+	}
+	return paths, missing
+}
+
+// combineWebParts concatenates the parts into a temp file in dir, opening
+// them one at a time so a large upload cannot exhaust file descriptors. It
+// returns the temp path (also on error, for cleanup), the size and the hex
+// MD5.
+func combineWebParts(dir string, parts []string) (string, int64, string, error) {
 	combined, err := os.CreateTemp(dir, "combined-*")
 	if err != nil {
-		s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: err.Error()}, http.StatusInternalServerError)
-		return
+		return "", 0, "", err
 	}
-	combinedPath := combined.Name()
-	defer s.removeTemp(combinedPath)
 	h := md5.New() // #nosec G401 -- S3 ETag checksum
 	var total int64
-	for _, part := range parts {
-		f, err := os.Open(part.path)
+	for _, path := range parts {
+		n, err := appendFile(io.MultiWriter(combined, h), path)
 		if err != nil {
-			_ = combined.Close() // error path; the deferred removeTemp deletes it
-			s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: err.Error()}, http.StatusInternalServerError)
-			return
-		}
-		n, copyErr := io.Copy(io.MultiWriter(combined, h), f)
-		_ = f.Close() // read-only upload source; Put/Copy reported read errors
-		if copyErr != nil {
-			_ = combined.Close() // error path; the deferred removeTemp deletes it
-			s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: copyErr.Error()}, http.StatusInternalServerError)
-			return
+			_ = combined.Close() // error path; the caller removes the file
+			return combined.Name(), 0, "", err
 		}
 		total += n
 	}
 	if err := combined.Close(); err != nil {
-		s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: err.Error()}, http.StatusInternalServerError)
-		return
+		return combined.Name(), 0, "", err
 	}
-	if up.Size > 0 && total != up.Size {
-		s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: l.t("flash.upload_size")}, http.StatusConflict)
-		return
+	return combined.Name(), total, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func appendFile(dst io.Writer, path string) (int64, error) {
+	f, err := os.Open(path) // #nosec G304 -- spool path built from the upload id and an int part number
+	if err != nil {
+		return 0, err
 	}
-	if s.Svc.MaxObjectBytes > 0 && total > s.Svc.MaxObjectBytes {
-		s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: l.t("err.too_large")}, http.StatusRequestEntityTooLarge)
-		return
-	}
-	_, putErr := s.Svc.PutFile(r.Context(), up.Bucket, up.Key, up.ContentType, combinedPath, total, hex.EncodeToString(h.Sum(nil)))
-	if putErr != nil {
-		// Keep the upload record and staged parts so a transient Drive error can
-		// be retried by selecting the same file again.
-		s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: l.errorText(putErr)}, http.StatusBadGateway)
-		return
-	}
-	_ = s.Store.DeleteUpload(r.Context(), up.ID)
-	s.removeDir(dir)
-	s.filePartial(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "ok", Text: l.t("flash.uploaded", 1)})
+	n, err := io.Copy(dst, f)
+	_ = f.Close() // read-only part file; io.Copy reported read errors
+	return n, err
 }
 
 func stagedUploadBytes(dir, exclude string) (int64, error) {
