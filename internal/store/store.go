@@ -203,7 +203,9 @@ func Open(path string, box *secure.Box) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db, box: box}
 	if err := s.migrate(); err != nil {
-		db.Close()
+		if cerr := db.Close(); cerr != nil {
+			return nil, errors.Join(err, fmt.Errorf("close database: %w", cerr))
+		}
 		return nil, err
 	}
 	return s, nil
@@ -370,7 +372,7 @@ func (s *Store) addColumn(table, name, def string) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	for rows.Next() {
 		var cid int
 		var cname, ctype string
@@ -513,7 +515,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]*Account, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	var out []*Account
 	for rows.Next() {
 		a, err := s.scanAccount(rows)
@@ -600,7 +602,7 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // no-op (ErrTxDone) after Commit
 	for _, q := range []string{
 		`DELETE FROM folder_cache WHERE account_id=?`,
 		`DELETE FROM drive_sessions WHERE account_id=?`,
@@ -649,7 +651,7 @@ func (s *Store) ListBuckets(ctx context.Context) ([]*Bucket, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	var out []*Bucket
 	for rows.Next() {
 		var b Bucket
@@ -676,7 +678,7 @@ func (s *Store) RenameBucket(ctx context.Context, oldName, newName string) error
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // no-op (ErrTxDone) after Commit
 	stmts := []string{
 		`UPDATE buckets SET name=? WHERE name=?`,
 		`UPDATE object_meta SET bucket=? WHERE bucket=?`,
@@ -773,7 +775,7 @@ func (s *Store) ListAccessKeys(ctx context.Context) ([]*AccessKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	var out []*AccessKey
 	for rows.Next() {
 		k, err := s.scanAccessKey(rows)
@@ -886,7 +888,7 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	var out []Event
 	for rows.Next() {
 		e, err := scanEvent(rows)
@@ -918,9 +920,10 @@ func (s *Store) ListEvents(ctx context.Context, f EventFilter) ([]Event, int, er
 		where = append(where, `access_key = ?`)
 		args = append(args, f.AccessKey)
 	}
-	if f.Status == "ok" {
+	switch f.Status {
+	case "ok":
 		where = append(where, `status < 400`)
-	} else if f.Status == "error" {
+	case "error":
 		where = append(where, `status >= 400`)
 	}
 	if !f.Since.IsZero() {
@@ -948,7 +951,7 @@ func (s *Store) ListEvents(ctx context.Context, f EventFilter) ([]Event, int, er
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	var out []Event
 	for rows.Next() {
 		e, err := scanEvent(rows)
@@ -1052,7 +1055,7 @@ func (s *Store) ListUploads(ctx context.Context, bucket string) ([]*Upload, erro
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	var out []*Upload
 	for rows.Next() {
 		u, err := scanUpload(rows)
@@ -1084,7 +1087,7 @@ func (s *Store) StaleUploads(ctx context.Context, t time.Time) ([]*Upload, error
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	var out []*Upload
 	for rows.Next() {
 		u, err := scanUpload(rows)
@@ -1136,7 +1139,7 @@ func (s *Store) RenameObjectMeta(ctx context.Context, bucket, oldKey, newKey str
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // no-op (ErrTxDone) after Commit
 	var m ObjectMeta
 	var updated int64
 	err = tx.QueryRowContext(ctx, `SELECT bucket,key,etag,content_type,storage_class,metadata,checksum,updated_at
@@ -1169,7 +1172,7 @@ func (s *Store) RenamePoolObject(ctx context.Context, oldKey, newKey string) err
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // no-op (ErrTxDone) after Commit
 	var p PoolObject
 	var updated int64
 	err = tx.QueryRowContext(ctx, `SELECT key,account_id,file_id,size,updated_at FROM pool_objects WHERE key=?`, oldKey).
@@ -1341,7 +1344,7 @@ func (s *Store) ListUsers(ctx context.Context) ([]*User, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	var out []*User
 	for rows.Next() {
 		var u User
@@ -1422,7 +1425,7 @@ func (s *Store) ListPoolObjects(ctx context.Context, prefix string) ([]PoolObjec
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }() // iteration errors come from rows.Err
 	var out []PoolObject
 	for rows.Next() {
 		var p PoolObject
