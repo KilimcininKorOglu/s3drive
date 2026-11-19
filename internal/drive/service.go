@@ -1154,22 +1154,22 @@ func (s *Service) spool(r io.Reader) (path string, size int64, md5hex string, er
 	}
 	path = f.Name()
 	h := newMD5()
-	var src io.Reader = r
+	src := r
 	if s.MaxObjectBytes > 0 {
 		src = io.LimitReader(r, s.MaxObjectBytes+1)
 	}
 	n, err := io.Copy(io.MultiWriter(f, h), src)
 	cerr := f.Close()
 	if err != nil {
-		_ = removeFile(path)
+		s.removeSpool(path)
 		return "", 0, "", err
 	}
 	if cerr != nil {
-		_ = removeFile(path)
+		s.removeSpool(path)
 		return "", 0, "", cerr
 	}
 	if s.MaxObjectBytes > 0 && n > s.MaxObjectBytes {
-		_ = removeFile(path)
+		s.removeSpool(path)
 		return "", 0, "", newError("EntityTooLarge", "object exceeds the configured %s limit", FormatBytes(s.MaxObjectBytes))
 	}
 	return path, n, hexString(h.Sum(nil)), nil

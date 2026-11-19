@@ -29,7 +29,7 @@ func (s *Service) Put(ctx context.Context, bucketName, key, contentType string, 
 	if err != nil {
 		return nil, err
 	}
-	defer removeFile(path)
+	defer s.removeSpool(path)
 	return s.putFile(ctx, bucketName, key, contentType, path, size, sum)
 }
 
@@ -85,7 +85,7 @@ func (s *Service) putFile(ctx context.Context, bucketName, key, contentType, pat
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // read-only spool file
 
 	existingID := ""
 	if existing != nil {
@@ -150,7 +150,7 @@ func (s *Service) PutVerified(ctx context.Context, bucketName, key, contentType 
 	if err != nil {
 		return nil, err
 	}
-	defer removeFile(path)
+	defer s.removeSpool(path)
 	if expectedMD5 != "" && !strings.EqualFold(sum, expectedMD5) {
 		return nil, newError("BadDigest", "the Content-MD5 you specified did not match what we received")
 	}
@@ -664,7 +664,7 @@ func (s *Service) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey
 	if err != nil {
 		return nil, err
 	}
-	defer reader.Body.Close()
+	defer func() { _ = reader.Body.Close() }() // read side; Put reports copy errors
 	res, err := s.Put(ctx, dstBucket, dstKey, srcFile.MimeType, reader.Body)
 	if err != nil {
 		return nil, err

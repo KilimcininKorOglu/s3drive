@@ -38,22 +38,22 @@ func (s *Service) spoolHashes(r io.Reader) (path string, size int64, sums Checks
 	hCRC32 := crc32.NewIEEE()
 	hCRC32C := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	writers := []io.Writer{f, hMD5, hSHA256, hSHA1, hCRC32, hCRC32C}
-	var src io.Reader = r
+	src := r
 	if s.MaxObjectBytes > 0 {
 		src = io.LimitReader(r, s.MaxObjectBytes+1)
 	}
 	n, err := io.Copy(io.MultiWriter(writers...), src)
 	cerr := f.Close()
 	if err != nil {
-		_ = removeFile(path)
+		s.removeSpool(path)
 		return "", 0, Checksums{}, err
 	}
 	if cerr != nil {
-		_ = removeFile(path)
+		s.removeSpool(path)
 		return "", 0, Checksums{}, cerr
 	}
 	if s.MaxObjectBytes > 0 && n > s.MaxObjectBytes {
-		_ = removeFile(path)
+		s.removeSpool(path)
 		return "", 0, Checksums{}, newError("EntityTooLarge", "object exceeds the configured %s limit", FormatBytes(s.MaxObjectBytes))
 	}
 	sums = Checksums{
@@ -72,7 +72,7 @@ func (s *Service) PutChecked(ctx context.Context, bucketName, key, contentType s
 	if err != nil {
 		return nil, err
 	}
-	defer removeFile(path)
+	defer s.removeSpool(path)
 	for algorithm, want := range expected {
 		if want == "" {
 			continue

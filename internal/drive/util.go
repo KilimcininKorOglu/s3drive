@@ -4,7 +4,9 @@ import (
 	"crypto/md5" // #nosec G501 -- S3 ETag checksum, not a security primitive
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"hash"
+	"io/fs"
 	"os"
 	"strings"
 )
@@ -39,4 +41,10 @@ func newMD5() hash.Hash { return md5.New() } // #nosec G401 -- S3 ETag checksum
 
 func hexString(b []byte) string { return hex.EncodeToString(b) }
 
-func removeFile(path string) error { return os.Remove(path) }
+// removeSpool deletes a spool file. A failure leaves data on disk, so it is
+// logged rather than dropped.
+func (s *Service) removeSpool(path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.Log.Warn("remove spool file", "path", path, "err", err)
+	}
+}
