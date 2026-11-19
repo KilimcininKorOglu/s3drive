@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"slices"
 	"strings"
 	"time"
 
@@ -37,6 +36,22 @@ func (s *Service) Put(ctx context.Context, bucketName, key, contentType string, 
 // reserveWrite picks the target account and folder and holds the pool space
 // reservation, the daily upload budget and an upload slot until release.
 func (s *Service) reserveWrite(ctx context.Context, ref *BucketRef, size int64) (*store.Account, string, func(), error) {
+	acct, folderID, releasePool, err := s.reservePool(ctx, ref, size)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	releaseSlots, err := s.reserveSlots(ctx, acct, size)
+	if err != nil {
+		releasePool()
+		return nil, "", nil, err
+	}
+	return acct, folderID, func() { releaseSlots(); releasePool() }, nil
+}
+
+// reservePool picks the target account and folder; for the pool it reserves
+// size bytes on that account until release, so parallel writes do not
+// overfill one account.
+func (s *Service) reservePool(ctx context.Context, ref *BucketRef, size int64) (*store.Account, string, func(), error) {
 	s.reserveMu.Lock()
 	acct, folderID, err := s.writeTarget(ctx, ref, size)
 	if err == nil && ref.Pool {
@@ -46,28 +61,25 @@ func (s *Service) reserveWrite(ctx context.Context, ref *BucketRef, size int64) 
 	if err != nil {
 		return nil, "", nil, err
 	}
-	releases := []func(){}
-	releaseAll := func() {
-		for _, r := range slices.Backward(releases) {
-			r()
-		}
+	if !ref.Pool {
+		return acct, folderID, func() {}, nil
 	}
-	if ref.Pool {
-		releases = append(releases, func() { s.addReservation(acct.ID, -size) })
-	}
+	return acct, folderID, func() { s.addReservation(acct.ID, -size) }, nil
+}
+
+// reserveSlots holds the account's daily upload budget and an upload slot
+// until release.
+func (s *Service) reserveSlots(ctx context.Context, acct *store.Account, size int64) (func(), error) {
 	releaseDaily, err := s.reserveDaily(ctx, acct, size)
 	if err != nil {
-		releaseAll()
-		return nil, "", nil, err
+		return nil, err
 	}
-	releases = append(releases, releaseDaily)
 	releaseSlot, err := s.acquireUploadSlot(ctx, acct)
 	if err != nil {
-		releaseAll()
-		return nil, "", nil, err
+		releaseDaily()
+		return nil, err
 	}
-	releases = append(releases, releaseSlot)
-	return acct, folderID, releaseAll, nil
+	return func() { releaseSlot(); releaseDaily() }, nil
 }
 
 // writeLocation creates the key's parent folders and returns the parent id
@@ -667,124 +679,124 @@ func (s *Service) deleteEmptyTree(ctx context.Context, bucketName, prefix string
 
 // Copy copies an object, server-side when both sides live in the same account.
 func (s *Service) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string) (*PutResult, error) {
-	srcAcct, srcFile, err := s.locate(ctx, srcBucket, srcKey)
-	if err != nil {
+	cp := &copyPlan{srcBucket: srcBucket, srcKey: srcKey, dstBucket: dstBucket, dstKey: dstKey}
+	var err error
+	if cp.srcAcct, cp.srcFile, err = s.locate(ctx, srcBucket, srcKey); err != nil {
 		return nil, err
 	}
 	if err := ValidateKey(dstKey); err != nil {
 		return nil, err
 	}
-	dstRef, err := s.Bucket(ctx, dstBucket)
+	if cp.dstRef, err = s.Bucket(ctx, dstBucket); err != nil {
+		return nil, err
+	}
+	if cp.dirs, cp.name, err = splitKey(dstKey); err != nil {
+		return nil, err
+	}
+	dstAcct, dstFolder, releasePool, err := s.reservePool(ctx, cp.dstRef, cp.srcFile.Size)
 	if err != nil {
 		return nil, err
 	}
-	dirs, name, err := splitKey(dstKey)
-	if err != nil {
-		return nil, err
+	if dstAcct.ID != cp.srcAcct.ID {
+		// Put chooses the destination account and reserves its own pool and
+		// daily quota, so the tentative reservation is released first.
+		releasePool()
+		return s.copyAcross(ctx, cp)
 	}
-	s.reserveMu.Lock()
-	dstAcct, dstFolder, err := s.writeTarget(ctx, dstRef, srcFile.Size)
-	if err == nil && dstRef.Pool {
-		s.addReservation(dstAcct.ID, srcFile.Size)
-	}
-	s.reserveMu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	releasePool := func() {}
-	if dstRef.Pool {
-		releasePool = func() { s.addReservation(dstAcct.ID, -srcFile.Size) }
-	}
-	defer func() { releasePool() }()
-	parent, err := s.ensureFolder(ctx, dstAcct, dstFolder, dirs)
-	if err != nil {
-		return nil, err
-	}
-	diskName := encodeSegment(name)
-	unlockObject := s.lockObjects(dstBucket + "/" + dstKey)
-	defer func() { unlockObject() }()
-	existing, err := s.Google.FindChild(ctx, dstAcct, parent, diskName, false)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-	if srcAcct.ID == dstAcct.ID && existing != nil && existing.ID == srcFile.ID {
-		// Copy onto itself: S3 allows this as a metadata replacement.
-		res := &PutResult{ETag: srcFile.MD5, Size: srcFile.Size, FileID: srcFile.ID, AccountID: srcAcct.ID, Modified: srcFile.Modified}
-		s.inheritObjectMeta(ctx, srcBucket, srcKey, dstBucket, dstKey, res.ETag)
-		return res, nil
-	}
-	if existing != nil && existing.IsFolder {
-		return nil, newError("InvalidArgument", "a folder named %q already exists", name)
-	}
+	defer releasePool()
+	return s.copyWithin(ctx, cp, dstAcct, dstFolder)
+}
 
-	var previousPool *store.PoolObject
-	if dstRef.Pool {
-		if p, err := s.Store.GetPoolObject(ctx, dstKey); err == nil {
-			previousPool = p
-		}
-	}
+// copyPlan is a validated copy request with its resolved source.
+type copyPlan struct {
+	srcBucket, srcKey, dstBucket, dstKey string
+	srcAcct                              *store.Account
+	srcFile                              *google.File
+	dstRef                               *BucketRef
+	dirs                                 []string
+	name                                 string
+}
 
-	if srcAcct.ID == dstAcct.ID {
-		releaseDaily, err := s.reserveDaily(ctx, dstAcct, srcFile.Size)
-		if err != nil {
-			return nil, err
-		}
-		defer releaseDaily()
-		release, err := s.acquireUploadSlot(ctx, dstAcct)
-		if err != nil {
-			return nil, err
-		}
-		defer release()
-
-		oldID := ""
-		if existing != nil {
-			oldID = existing.ID
-		}
-		copied, err := s.Google.Copy(ctx, dstAcct, srcFile.ID, diskName, parent)
-		if err != nil {
-			return nil, err
-		}
-		if oldID != "" {
-			// Copy first, then remove the old object. If removal fails, remove
-			// the copy so the previous object is never silently destroyed.
-			if err := s.Google.Delete(ctx, dstAcct, oldID); err != nil && !isGoogleNotFound(err) {
-				if derr := s.Google.Delete(ctx, dstAcct, copied.ID); derr != nil {
-					return nil, errors.Join(err, fmt.Errorf("remove copy after failed replace: %w", derr))
-				}
-				return nil, err
-			}
-		}
-		s.logStoreErr("record daily upload usage", dstKey, s.Store.AddUploadUsage(ctx, dstAcct.ID, copied.Size))
-		if dstRef.Pool {
-			// Point the index at the copy before dropping the old one.
-			if err := s.Store.PutPoolObject(ctx, store.PoolObject{Key: dstKey, AccountID: dstAcct.ID, FileID: copied.ID, Size: copied.Size}); err != nil {
-				return nil, fmt.Errorf("update pool index: %w", err)
-			}
-			s.dropStalePoolCopy(ctx, dstKey, previousPool, copied.ID)
-		}
-		res := &PutResult{ETag: srcFile.MD5, Size: copied.Size, FileID: copied.ID, AccountID: dstAcct.ID, Modified: copied.Modified}
-		s.inheritObjectMeta(ctx, srcBucket, srcKey, dstBucket, dstKey, res.ETag)
-		return res, nil
-	}
-
-	// Cross-account: stream the source into the destination account. Put will
-	// choose the destination account and reserve its own pool/daily quota, so
-	// release the tentative destination reservation and lock first.
-	releasePool()
-	releasePool = func() {}
-	unlockObject()
-	unlockObject = func() {}
-	reader, err := s.Get(ctx, srcBucket, srcKey, "")
+// copyAcross streams the source into the destination through Put.
+func (s *Service) copyAcross(ctx context.Context, cp *copyPlan) (*PutResult, error) {
+	reader, err := s.Get(ctx, cp.srcBucket, cp.srcKey, "")
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = reader.Body.Close() }() // read side; Put reports copy errors
-	res, err := s.Put(ctx, dstBucket, dstKey, srcFile.MimeType, reader.Body)
+	res, err := s.Put(ctx, cp.dstBucket, cp.dstKey, cp.srcFile.MimeType, reader.Body)
 	if err != nil {
 		return nil, err
 	}
-	s.inheritObjectMeta(ctx, srcBucket, srcKey, dstBucket, dstKey, res.ETag)
+	s.inheritObjectMeta(ctx, cp.srcBucket, cp.srcKey, cp.dstBucket, cp.dstKey, res.ETag)
 	return res, nil
+}
+
+// copyWithin copies on Drive inside one account. A copy onto itself is an
+// S3 metadata replacement and leaves the file alone.
+func (s *Service) copyWithin(ctx context.Context, cp *copyPlan, acct *store.Account, folderID string) (*PutResult, error) {
+	unlockObject := s.lockObjects(cp.dstBucket + "/" + cp.dstKey)
+	defer unlockObject()
+	diskName := encodeSegment(cp.name)
+	parent, existingID, err := s.copyLocation(ctx, cp, acct, folderID, diskName)
+	if err != nil {
+		return nil, err
+	}
+	if existingID == cp.srcFile.ID {
+		f := cp.srcFile
+		res := &PutResult{ETag: f.MD5, Size: f.Size, FileID: f.ID, AccountID: acct.ID, Modified: f.Modified}
+		s.inheritObjectMeta(ctx, cp.srcBucket, cp.srcKey, cp.dstBucket, cp.dstKey, res.ETag)
+		return res, nil
+	}
+	previous, err := s.previousPoolCopy(ctx, cp.dstRef, cp.dstKey)
+	if err != nil {
+		return nil, err
+	}
+	release, err := s.reserveSlots(ctx, acct, cp.srcFile.Size)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	copied, err := s.copyReplacing(ctx, acct, cp.srcFile.ID, diskName, parent, existingID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.recordUpload(ctx, cp.dstRef, cp.dstKey, acct.ID, copied.ID, copied.Size, previous); err != nil {
+		return nil, err
+	}
+	res := &PutResult{ETag: cp.srcFile.MD5, Size: copied.Size, FileID: copied.ID, AccountID: acct.ID, Modified: copied.Modified}
+	s.inheritObjectMeta(ctx, cp.srcBucket, cp.srcKey, cp.dstBucket, cp.dstKey, res.ETag)
+	return res, nil
+}
+
+// copyLocation creates the destination folders and returns the parent and
+// the id of an existing file at the destination ("" if none). A folder of
+// that name blocks the copy.
+func (s *Service) copyLocation(ctx context.Context, cp *copyPlan, acct *store.Account, folderID, diskName string) (string, string, error) {
+	parent, err := s.ensureFolder(ctx, acct, folderID, cp.dirs)
+	if err != nil {
+		return "", "", err
+	}
+	existingID, err := s.replaceableFile(ctx, acct, parent, diskName, cp.name)
+	return parent, existingID, err
+}
+
+// copyReplacing copies first, then removes the file it replaces. If that
+// removal fails, the copy is removed so the previous object is never
+// silently destroyed.
+func (s *Service) copyReplacing(ctx context.Context, acct *store.Account, srcID, diskName, parent, oldID string) (*google.File, error) {
+	copied, err := s.Google.Copy(ctx, acct, srcID, diskName, parent)
+	if err != nil || oldID == "" {
+		return copied, err
+	}
+	err = s.Google.Delete(ctx, acct, oldID)
+	if err == nil || isGoogleNotFound(err) {
+		return copied, nil
+	}
+	if derr := s.Google.Delete(ctx, acct, copied.ID); derr != nil {
+		return nil, errors.Join(err, fmt.Errorf("remove copy after failed replace: %w", derr))
+	}
+	return nil, err
 }
 
 // inheritObjectMeta copies stored S3 semantics (content type, user metadata,
