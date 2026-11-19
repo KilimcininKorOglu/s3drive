@@ -64,16 +64,8 @@ type chunkedReader struct {
 
 func (c *chunkedReader) Read(p []byte) (int, error) {
 	for {
-		if c.done {
-			return 0, io.EOF
-		}
-		if c.remaining == 0 {
-			if err := c.nextChunk(); err != nil {
-				return 0, err
-			}
-			if c.done {
-				return 0, io.EOF
-			}
+		if err := c.ensureChunk(); err != nil {
+			return 0, err
 		}
 		n := len(p)
 		if int64(n) > c.remaining {
@@ -81,26 +73,49 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 		}
 		read, err := c.br.Read(p[:n])
 		if read > 0 {
-			c.remaining -= int64(read)
-			if c.verify {
-				c.chunkHash.Write(p[:read])
+			if ferr := c.consume(p[:read]); ferr != nil && err == nil {
+				err = ferr
 			}
-			for _, h := range c.trailers {
-				_, _ = h.Write(p[:read])
-			}
-			if c.remaining == 0 {
-				if ferr := c.finishChunk(); ferr != nil && err == nil {
-					err = ferr
-				}
-			}
-		}
-		if read > 0 {
 			return read, err
 		}
 		if err != nil {
 			return 0, err
 		}
 	}
+}
+
+// ensureChunk positions the reader inside a data chunk; it returns io.EOF
+// once the final chunk and trailers have been read.
+func (c *chunkedReader) ensureChunk() error {
+	if c.done {
+		return io.EOF
+	}
+	if c.remaining != 0 {
+		return nil
+	}
+	if err := c.nextChunk(); err != nil {
+		return err
+	}
+	if c.done {
+		return io.EOF
+	}
+	return nil
+}
+
+// consume feeds payload bytes to the chunk signature and trailer checksums
+// and verifies the chunk once it is complete.
+func (c *chunkedReader) consume(b []byte) error {
+	c.remaining -= int64(len(b))
+	if c.verify {
+		c.chunkHash.Write(b)
+	}
+	for _, h := range c.trailers {
+		_, _ = h.Write(b) // hash.Hash.Write never returns an error
+	}
+	if c.remaining == 0 {
+		return c.finishChunk()
+	}
+	return nil
 }
 
 func (c *chunkedReader) nextChunk() error {
@@ -122,43 +137,57 @@ func (c *chunkedReader) nextChunk() error {
 		c.chunkHash.Reset()
 	}
 	if size == 0 {
-		// The zero-size chunk is signed as well; verify it before consuming
-		// the trailer block.
-		if err := c.checkChunkSignature(); err != nil {
-			return err
-		}
-		// Consume optional trailers, then the terminating blank line.
-		seen := map[string]string{}
-		for {
-			line, err := c.readLine()
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				return err
-			}
-			if line == "" {
-				break
-			}
-			name, value, ok := strings.Cut(line, ":")
-			if ok {
-				seen[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
-			}
-		}
-		for name, h := range c.trailers {
-			want, ok := seen[name]
-			if !ok || want == "" {
-				return fmt.Errorf("aws-chunked: missing trailer %s", name)
-			}
-			got := base64.StdEncoding.EncodeToString(h.Sum(nil))
-			if got != want {
-				return fmt.Errorf("aws-chunked: %s checksum mismatch", name)
-			}
-		}
-		c.done = true
-		return nil
+		return c.finishStream()
 	}
 	c.remaining = size
+	return nil
+}
+
+// finishStream handles the zero-size final chunk: it is signed as well, so
+// its signature is verified before the trailer block is read and checked.
+func (c *chunkedReader) finishStream() error {
+	if err := c.checkChunkSignature(); err != nil {
+		return err
+	}
+	seen, err := c.readTrailers()
+	if err != nil {
+		return err
+	}
+	if err := c.verifyTrailers(seen); err != nil {
+		return err
+	}
+	c.done = true
+	return nil
+}
+
+// readTrailers consumes optional "name: value" trailers up to the blank
+// line (or EOF) that ends the body.
+func (c *chunkedReader) readTrailers() (map[string]string, error) {
+	seen := map[string]string{}
+	for {
+		line, err := c.readLine()
+		if errors.Is(err, io.EOF) || (err == nil && line == "") {
+			return seen, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if name, value, ok := strings.Cut(line, ":"); ok {
+			seen[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
+		}
+	}
+}
+
+func (c *chunkedReader) verifyTrailers(seen map[string]string) error {
+	for name, h := range c.trailers {
+		want := seen[name]
+		if want == "" {
+			return fmt.Errorf("aws-chunked: missing trailer %s", name)
+		}
+		if base64.StdEncoding.EncodeToString(h.Sum(nil)) != want {
+			return fmt.Errorf("aws-chunked: %s checksum mismatch", name)
+		}
+	}
 	return nil
 }
 
