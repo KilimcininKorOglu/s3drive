@@ -52,6 +52,45 @@ func run() error {
 	}
 	defer closeLogged(st, "database", logger)
 
+	s3srv, ui, err := newHandlers(cfg, st, logger)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	pruneCtx, cancelPrune := context.WithCancel(context.Background())
+	defer cancelPrune()
+	startMaintenance(pruneCtx, st, cfg.SpoolDir, logger)
+
+	s3ln, uiLn, err := listenBoth(&cfg)
+	if err != nil {
+		return err
+	}
+	warnConfig(&cfg,uiLn.Addr().String(), logger)
+	logger.Info("s3drive starting", "version", config.Version,
+		"s3", s3ln.Addr().String(), "ui", uiLn.Addr().String(), "data", cfg.DataDir)
+
+	s3HTTP, uiHTTP := newHTTPServer(cfg.S3Addr, s3srv), newHTTPServer(cfg.UIAddr, ui)
+	errCh := make(chan error, 2)
+	logger.Info("s3 endpoint listening", "addr", s3ln.Addr().String())
+	go serve(s3HTTP, s3ln, "s3 server", errCh)
+	logger.Info("web console listening", "url", cfg.PublicURL)
+	go serve(uiHTTP, uiLn, "ui server", errCh)
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+		logger.Info("shutdown requested")
+	case runErr = <-errCh:
+		logger.Error("listener failed", "err", runErr)
+	}
+	shutdownAll(cfg.ShutdownTimeout, logger, map[string]*http.Server{"ui": uiHTTP, "s3": s3HTTP})
+	return runErr
+}
+
+func newHandlers(cfg config.Config, st *store.Store, logger *slog.Logger) (http.Handler, http.Handler, error) {
 	gc := google.NewClient(st)
 	svc := drive.New(st, gc, cfg.SpoolDir, cfg.PublicURL, logger)
 	svc.MaxObjectBytes = cfg.MaxObjectBytes
@@ -62,103 +101,81 @@ func run() error {
 	s3srv := &s3.Server{Store: st, Svc: svc, Auth: auth, Log: logger, SpoolDir: cfg.SpoolDir}
 	ui, err := webui.New(cfg, st, svc, gc, logger)
 	if err != nil {
-		return fmt.Errorf("web ui: %w", err)
+		return nil, nil, fmt.Errorf("web ui: %w", err)
 	}
+	return s3srv, ui, nil
+}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	pruneCtx, cancelPrune := context.WithCancel(context.Background())
-	defer cancelPrune()
-	maintenance(pruneCtx, st, cfg.SpoolDir, logger, true)
+// startMaintenance runs one startup pass, then one every six hours until
+// ctx ends.
+func startMaintenance(ctx context.Context, st *store.Store, spoolDir string, logger *slog.Logger) {
+	maintenance(ctx, st, spoolDir, logger, true)
 	go func() {
 		t := time.NewTicker(6 * time.Hour)
 		defer t.Stop()
 		for {
 			select {
-			case <-pruneCtx.Done():
+			case <-ctx.Done():
 				return
 			case <-t.C:
-				maintenance(pruneCtx, st, cfg.SpoolDir, logger, false)
+				maintenance(ctx, st, spoolDir, logger, false)
 			}
 		}
 	}()
+}
 
-	s3HTTP := &http.Server{
-		Addr:              cfg.S3Addr,
-		Handler:           s3srv,
-		ReadHeaderTimeout: 15 * time.Second,
-		IdleTimeout:       90 * time.Second,
-	}
-	uiHTTP := &http.Server{
-		Addr:              cfg.UIAddr,
-		Handler:           ui,
-		ReadHeaderTimeout: 15 * time.Second,
-		IdleTimeout:       90 * time.Second,
-	}
-
-	s3ln, err := net.Listen("tcp", cfg.S3Addr)
+func listenBoth(cfg *config.Config) (s3ln, uiLn net.Listener, err error) {
+	s3ln, err = net.Listen("tcp", cfg.S3Addr)
 	if err != nil {
-		return fmt.Errorf("listen s3 %s: %w", cfg.S3Addr, err)
+		return nil, nil, fmt.Errorf("listen s3 %s: %w", cfg.S3Addr, err)
 	}
-	uiLn, err := net.Listen("tcp", cfg.UIAddr)
+	uiLn, err = net.Listen("tcp", cfg.UIAddr)
 	if err != nil {
-		_ = s3ln.Close()
-		return fmt.Errorf("listen ui %s: %w", cfg.UIAddr, err)
+		return nil, nil, errors.Join(fmt.Errorf("listen ui %s: %w", cfg.UIAddr, err), s3ln.Close())
 	}
+	return s3ln, uiLn, nil
+}
 
+func warnConfig(cfg *config.Config, uiAddr string, logger *slog.Logger) {
 	if cfg.UIPassword == "" {
 		logger.Warn("UI password is not set; anybody who can reach the console has full access",
-			"addr", uiLn.Addr().String(), "hint", "set S3DRIVE_UI_PASSWORD")
+			"addr", uiAddr, "hint", "set S3DRIVE_UI_PASSWORD")
 	}
-	if strings.Contains(cfg.PublicURL, "localhost") && !strings.Contains(uiLn.Addr().String(), "8080") {
+	if strings.Contains(cfg.PublicURL, "localhost") && !strings.Contains(uiAddr, "8080") {
 		logger.Warn("public URL does not look like the UI listener; OAuth redirects may fail",
-			"public_url", cfg.PublicURL, "ui_addr", uiLn.Addr().String())
+			"public_url", cfg.PublicURL, "ui_addr", uiAddr)
 	}
+}
 
-	logger.Info("s3drive starting", "version", config.Version,
-		"s3", s3ln.Addr().String(), "ui", uiLn.Addr().String(), "data", cfg.DataDir)
-
-	errCh := make(chan error, 2)
-	go func() {
-		logger.Info("s3 endpoint listening", "addr", s3ln.Addr().String())
-		if err := s3HTTP.Serve(s3ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("s3 server: %w", err)
-		}
-	}()
-	go func() {
-		logger.Info("web console listening", "url", cfg.PublicURL)
-		if err := uiHTTP.Serve(uiLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("ui server: %w", err)
-		}
-	}()
-
-	var runErr error
-	select {
-	case <-ctx.Done():
-		logger.Info("shutdown requested")
-	case runErr = <-errCh:
-		logger.Error("listener failed", "err", runErr)
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       90 * time.Second,
 	}
+}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+// serve reports any listener failure other than a graceful shutdown.
+func serve(srv *http.Server, ln net.Listener, name string, errCh chan<- error) {
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		errCh <- fmt.Errorf("%s: %w", name, err)
+	}
+}
+
+// shutdownAll drains every server concurrently within one shared timeout.
+func shutdownAll(timeout time.Duration, logger *slog.Logger, servers map[string]*http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		if err := uiHTTP.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("ui shutdown", "err", err)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if err := s3HTTP.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("s3 shutdown", "err", err)
-		}
-	}()
+	for name, srv := range servers {
+		wg.Go(func() {
+			if err := srv.Shutdown(ctx); err != nil {
+				logger.Warn(name+" shutdown", "err", err)
+			}
+		})
+	}
 	wg.Wait()
-	return runErr
 }
 
 func newLogger(level string) *slog.Logger {
