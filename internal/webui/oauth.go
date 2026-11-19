@@ -23,12 +23,12 @@ func (s *Server) oauthStart(w http.ResponseWriter, r *http.Request) {
 
 	cfg, err := s.Google.OAuthConfig(ctx, s.publicURL(r))
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
 	if cfg.ClientID == "" || cfg.ClientSecret == "" {
-		s.setFlash(w, "error", l.t("flash.oauth_missing"))
+		s.setFlash(w, r, "error", l.t("flash.oauth_missing"))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
@@ -38,7 +38,7 @@ func (s *Server) oauthStart(w http.ResponseWriter, r *http.Request) {
 	if accountID != "" {
 		acct, err := s.Store.GetAccount(ctx, accountID)
 		if err != nil {
-			s.setFlash(w, "error", l.errorText(err))
+			s.setFlash(w, r, "error", l.errorText(err))
 			http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 			return
 		}
@@ -51,18 +51,18 @@ func (s *Server) oauthStart(w http.ResponseWriter, r *http.Request) {
 
 	state, err := randomState()
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
 	verifier, challenge, err := google.NewVerifier()
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
 	if err := s.Store.CreateOAuthState(ctx, state, verifier, accountID); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
@@ -82,7 +82,7 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		if d := q.Get("error_description"); d != "" {
 			msg += ": " + d
 		}
-		s.setFlash(w, "error", l.t("oauth.failed", msg))
+		s.setFlash(w, r, "error", l.t("oauth.failed", msg))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
@@ -90,16 +90,16 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	state := q.Get("state")
 	code := q.Get("code")
 	if state == "" || code == "" {
-		s.setFlash(w, "error", l.t("oauth.missing_state"))
+		s.setFlash(w, r, "error", l.t("oauth.missing_state"))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
 	verifier, accountID, err := s.Store.ConsumeOAuthState(ctx, state)
 	if err != nil {
 		if errors.Is(err, store.ErrExpired) {
-			s.setFlash(w, "error", l.t("oauth.state_expired"))
+			s.setFlash(w, r, "error", l.t("oauth.state_expired"))
 		} else {
-			s.setFlash(w, "error", l.t("oauth.state_invalid"))
+			s.setFlash(w, r, "error", l.t("oauth.state_invalid"))
 		}
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
@@ -107,7 +107,7 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 
 	cfg, err := s.Google.OAuthConfig(ctx, s.publicURL(r))
 	if err != nil || cfg.ClientID == "" || cfg.ClientSecret == "" {
-		s.setFlash(w, "error", l.t("flash.oauth_missing"))
+		s.setFlash(w, r, "error", l.t("flash.oauth_missing"))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
@@ -115,7 +115,7 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	if accountID != "" {
 		existing, err = s.Store.GetAccount(ctx, accountID)
 		if err != nil {
-			s.setFlash(w, "error", l.errorText(err))
+			s.setFlash(w, r, "error", l.errorText(err))
 			http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 			return
 		}
@@ -126,7 +126,7 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 
 	tok, err := s.Google.Exchange(ctx, cfg, code, verifier)
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
@@ -143,7 +143,7 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	about, err := s.Google.About(ctx, temp)
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
@@ -178,22 +178,22 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.Store.UpdateAccountOAuth(ctx, existing.ID, cfg.ClientID, cfg.ClientSecret, refresh,
 			tok.AccessToken, tok.Expiry, root); err != nil {
-			s.setFlash(w, "error", l.errorText(err))
+			s.setFlash(w, r, "error", l.errorText(err))
 			http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 			return
 		}
 		if err := s.Store.UpdateAccountProfile(ctx, existing.ID, name, about.Email, about.Picture, root); err != nil {
-			s.setFlash(w, "error", l.errorText(err))
+			s.setFlash(w, r, "error", l.errorText(err))
 			http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 			return
 		}
-		s.setFlash(w, "ok", l.t("flash.account_updated", about.Email))
+		s.setFlash(w, r, "ok", l.t("flash.account_updated", about.Email))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
 
 	if tok.RefreshToken == "" {
-		s.setFlash(w, "error", l.t("oauth.no_refresh"))
+		s.setFlash(w, r, "error", l.t("oauth.no_refresh"))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
@@ -204,11 +204,11 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		TokenExpiry: tok.Expiry, RootID: rootID,
 	}
 	if err := s.Store.CreateAccount(ctx, acct); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
-	s.setFlash(w, "ok", l.t("flash.account_connected", about.Email))
+	s.setFlash(w, r, "ok", l.t("flash.account_connected", about.Email))
 	http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 }
 

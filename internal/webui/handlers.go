@@ -993,7 +993,7 @@ func (s *Server) buckets(w http.ResponseWriter, r *http.Request) {
 	b := s.base(w, r, l.t("nav.buckets"), l.t("buckets.subtitle"), "buckets", true)
 	refs, err := s.Svc.ListBuckets(r.Context())
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	}
 	accounts, _ := s.Store.ListAccounts(r.Context())
 	data := bucketData{baseData: b, Accounts: accounts, UsageLoaded: r.URL.Query().Get("usage") == "1"}
@@ -1029,18 +1029,18 @@ func (s *Server) createBucket(w http.ResponseWriter, r *http.Request) {
 	name := strings.ToLower(strings.TrimSpace(r.FormValue("name")))
 	account := r.FormValue("account")
 	if !drive.ValidBucketName(name) {
-		s.setFlash(w, "error", l.t("flash.invalid_bucket"))
+		s.setFlash(w, r, "error", l.t("flash.invalid_bucket"))
 		http.Redirect(w, r, "/buckets", http.StatusSeeOther)
 		return
 	}
 	ref, err := s.Svc.CreateBucket(r.Context(), name, account)
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/buckets", http.StatusSeeOther)
 		return
 	}
 	_ = ref
-	s.setFlash(w, "ok", l.t("flash.bucket_created", name))
+	s.setFlash(w, r, "ok", l.t("flash.bucket_created", name))
 	http.Redirect(w, r, "/buckets", http.StatusSeeOther)
 }
 
@@ -1048,9 +1048,9 @@ func (s *Server) deleteBucket(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
 	name := r.FormValue("name")
 	if err := s.Svc.DeleteBucket(r.Context(), name); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.bucket_deleted", name))
+		s.setFlash(w, r, "ok", l.t("flash.bucket_deleted", name))
 	}
 	http.Redirect(w, r, "/buckets", http.StatusSeeOther)
 }
@@ -1060,14 +1060,14 @@ func (s *Server) renameBucket(w http.ResponseWriter, r *http.Request) {
 	oldName := strings.TrimSpace(r.FormValue("name"))
 	newName := strings.ToLower(strings.TrimSpace(r.FormValue("new_name")))
 	if !drive.ValidBucketName(newName) {
-		s.setFlash(w, "error", l.t("flash.invalid_bucket"))
+		s.setFlash(w, r, "error", l.t("flash.invalid_bucket"))
 		http.Redirect(w, r, "/buckets", http.StatusSeeOther)
 		return
 	}
 	if err := s.Svc.RenameBucket(r.Context(), oldName, newName); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.bucket_renamed", oldName, newName))
+		s.setFlash(w, r, "ok", l.t("flash.bucket_renamed", oldName, newName))
 	}
 	http.Redirect(w, r, "/buckets", http.StatusSeeOther)
 }
@@ -1077,11 +1077,11 @@ func (s *Server) togglePublic(w http.ResponseWriter, r *http.Request) {
 	name := r.FormValue("name")
 	public := r.FormValue("public") == "1"
 	if err := s.Svc.SetPublicRead(r.Context(), name, public); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else if public {
-		s.setFlash(w, "ok", l.t("flash.bucket_public", name))
+		s.setFlash(w, r, "ok", l.t("flash.bucket_public", name))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.bucket_private", name))
+		s.setFlash(w, r, "ok", l.t("flash.bucket_private", name))
 	}
 	http.Redirect(w, r, "/buckets", http.StatusSeeOther)
 }
@@ -1128,14 +1128,14 @@ func (s *Server) renameAccount(w http.ResponseWriter, r *http.Request) {
 		name = name[:80]
 	}
 	if name == "" {
-		s.setFlash(w, "error", l.t("flash.invalid_name"))
+		s.setFlash(w, r, "error", l.t("flash.invalid_name"))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
 	if err := s.Store.UpdateAccountName(r.Context(), id, name); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.account_renamed"))
+		s.setFlash(w, r, "ok", l.t("flash.account_renamed"))
 	}
 	http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 }
@@ -1146,25 +1146,25 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	buckets, _ := s.Store.ListBuckets(r.Context())
 	for _, b := range buckets {
 		if b.AccountID == id {
-			s.setFlash(w, "error", l.t("flash.buckets_exist"))
+			s.setFlash(w, r, "error", l.t("flash.buckets_exist"))
 			http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 			return
 		}
 	}
 	if pooled, err := s.Store.CountPoolObjectsByAccount(r.Context(), id); err == nil && pooled > 0 {
-		s.setFlash(w, "error", l.t("flash.account_pool_objects", pooled))
+		s.setFlash(w, r, "error", l.t("flash.account_pool_objects", pooled))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
 	if uploads, err := s.Store.CountUploadsByAccount(r.Context(), id); err == nil && uploads > 0 {
-		s.setFlash(w, "error", l.t("flash.account_uploads", uploads))
+		s.setFlash(w, r, "error", l.t("flash.account_uploads", uploads))
 		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 		return
 	}
 	if err := s.Store.DeleteAccount(r.Context(), id); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.account_deleted"))
+		s.setFlash(w, r, "ok", l.t("flash.account_deleted"))
 	}
 	http.Redirect(w, r, "/accounts", http.StatusSeeOther)
 }
@@ -1238,7 +1238,7 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 	f.Offset = (page - 1) * f.Limit
 	events, total, err := s.Store.ListEvents(r.Context(), f)
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	}
 	data := auditData{baseData: b, Total: total, Page: page, Filter: f, SinceText: sinceText, UntilText: untilText}
 	data.Pages = (total + f.Limit - 1) / f.Limit
@@ -1398,11 +1398,11 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 	key := &store.AccessKey{AccessKey: access, Secret: secret, Label: label, Active: true,
 		Permission: permission, Bucket: bucket, Prefix: prefix, ExpiresAt: expires}
 	if err := s.Store.CreateAccessKey(r.Context(), key); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/keys", http.StatusSeeOther)
 		return
 	}
-	s.setFlashSecret(w, "ok", l.t("flash.key_created"), access+"  /  "+secret)
+	s.setFlashSecret(w, r, "ok", l.t("flash.key_created"), access+"  /  "+secret)
 	http.Redirect(w, r, "/keys", http.StatusSeeOther)
 }
 
@@ -1411,9 +1411,9 @@ func (s *Server) toggleKey(w http.ResponseWriter, r *http.Request) {
 	access := r.FormValue("access_key")
 	active := r.FormValue("active") == "1"
 	if err := s.Store.SetAccessKeyActive(r.Context(), access, active); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.key_toggled"))
+		s.setFlash(w, r, "ok", l.t("flash.key_toggled"))
 	}
 	http.Redirect(w, r, "/keys", http.StatusSeeOther)
 }
@@ -1440,18 +1440,18 @@ func (s *Server) presign(w http.ResponseWriter, r *http.Request) {
 		minutes = 15
 	}
 	if accessKey == "" || bucket == "" || key == "" {
-		s.setFlash(w, "error", l.t("flash.presign_fields"))
+		s.setFlash(w, r, "error", l.t("flash.presign_fields"))
 		http.Redirect(w, r, "/keys", http.StatusSeeOther)
 		return
 	}
 	if method != http.MethodGet && method != http.MethodPut && method != http.MethodHead {
-		s.setFlash(w, "error", l.t("flash.presign_method"))
+		s.setFlash(w, r, "error", l.t("flash.presign_method"))
 		http.Redirect(w, r, "/keys", http.StatusSeeOther)
 		return
 	}
 	keyRow, err := s.Store.GetAccessKey(r.Context(), accessKey)
 	if err != nil || keyRow.Secret == "" || !keyRow.Valid(time.Now()) {
-		s.setFlash(w, "error", l.t("flash.presign_key"))
+		s.setFlash(w, r, "error", l.t("flash.presign_key"))
 		http.Redirect(w, r, "/keys", http.StatusSeeOther)
 		return
 	}
@@ -1460,12 +1460,12 @@ func (s *Server) presign(w http.ResponseWriter, r *http.Request) {
 		allowed = keyRow.CanWrite(bucket, key)
 	}
 	if !allowed {
-		s.setFlash(w, "error", l.t("flash.presign_policy"))
+		s.setFlash(w, r, "error", l.t("flash.presign_policy"))
 		http.Redirect(w, r, "/keys", http.StatusSeeOther)
 		return
 	}
 	if _, err := s.Svc.Bucket(r.Context(), bucket); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/keys", http.StatusSeeOther)
 		return
 	}
@@ -1474,20 +1474,20 @@ func (s *Server) presign(w http.ResponseWriter, r *http.Request) {
 	raw := strings.TrimRight(s.s3Endpoint(r), "/") + "/" + url.PathEscape(bucket) + "/" + escapeKeyPath(key)
 	link, err := s3.SignQueryMethod(raw, accessKey, secret, cfg.Region, method, time.Now().Add(time.Duration(minutes)*time.Minute))
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/keys", http.StatusSeeOther)
 		return
 	}
-	s.setFlashSecret(w, "ok", l.t("flash.presigned", minutes), link)
+	s.setFlashSecret(w, r, "ok", l.t("flash.presigned", minutes), link)
 	http.Redirect(w, r, "/keys", http.StatusSeeOther)
 }
 
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
 	if err := s.Store.DeleteAccessKey(r.Context(), r.FormValue("access_key")); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.key_deleted"))
+		s.setFlash(w, r, "ok", l.t("flash.key_deleted"))
 	}
 	http.Redirect(w, r, "/keys", http.StatusSeeOther)
 }
@@ -1588,20 +1588,20 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		role = "admin"
 	}
 	if !validUsername(username) {
-		s.setFlash(w, "error", l.t("flash.invalid_username"))
+		s.setFlash(w, r, "error", l.t("flash.invalid_username"))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
 	hash, err := secure.HashPassword(password)
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
 	if err := s.Store.CreateUser(r.Context(), &store.User{Username: username, PasswordHash: hash, Role: role}); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.user_created", username))
+		s.setFlash(w, r, "ok", l.t("flash.user_created", username))
 	}
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
@@ -1610,14 +1610,14 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
 	id := r.FormValue("id")
 	if info := s.session(r); info != nil && info.UserID == id {
-		s.setFlash(w, "error", l.t("flash.user_self"))
+		s.setFlash(w, r, "error", l.t("flash.user_self"))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
 	if err := s.Store.DeleteUser(r.Context(), id); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.user_deleted"))
+		s.setFlash(w, r, "ok", l.t("flash.user_deleted"))
 	}
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
@@ -1628,14 +1628,14 @@ func (s *Server) changeUserPassword(w http.ResponseWriter, r *http.Request) {
 	password := r.FormValue("password")
 	hash, err := secure.HashPassword(password)
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
 	if err := s.Store.UpdateUserPassword(r.Context(), id, hash); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.user_password"))
+		s.setFlash(w, r, "ok", l.t("flash.user_password"))
 	}
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
@@ -1646,7 +1646,7 @@ func (s *Server) saveOAuthSettings(w http.ResponseWriter, r *http.Request) {
 	secret := strings.TrimSpace(r.FormValue("client_secret"))
 	existing, err := s.Google.OAuthConfig(r.Context(), s.publicURL(r))
 	if err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
@@ -1654,14 +1654,14 @@ func (s *Server) saveOAuthSettings(w http.ResponseWriter, r *http.Request) {
 		secret = existing.ClientSecret
 	}
 	if clientID == "" {
-		s.setFlash(w, "error", l.t("settings.client_required"))
+		s.setFlash(w, r, "error", l.t("settings.client_required"))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
 	if err := s.Google.SaveOAuthConfig(r.Context(), clientID, secret); err != nil {
-		s.setFlash(w, "error", l.errorText(err))
+		s.setFlash(w, r, "error", l.errorText(err))
 	} else {
-		s.setFlash(w, "ok", l.t("flash.settings_saved"))
+		s.setFlash(w, r, "ok", l.t("flash.settings_saved"))
 	}
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
@@ -1673,7 +1673,7 @@ func (s *Server) saveServerSettings(w http.ResponseWriter, r *http.Request) {
 	if publicURL != "" {
 		u, err := url.Parse(publicURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			s.setFlash(w, "error", l.t("settings.public_url_invalid"))
+			s.setFlash(w, r, "error", l.t("settings.public_url_invalid"))
 			http.Redirect(w, r, "/settings", http.StatusSeeOther)
 			return
 		}
@@ -1687,7 +1687,7 @@ func (s *Server) saveServerSettings(w http.ResponseWriter, r *http.Request) {
 		poolName = "pool"
 	}
 	if !drive.ValidBucketName(poolName) {
-		s.setFlash(w, "error", l.t("flash.invalid_bucket"))
+		s.setFlash(w, r, "error", l.t("flash.invalid_bucket"))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
@@ -1700,7 +1700,7 @@ func (s *Server) saveServerSettings(w http.ResponseWriter, r *http.Request) {
 		namespace = "s3drive"
 	}
 	if strings.ContainsAny(namespace, `/\`) || len(namespace) > 200 {
-		s.setFlash(w, "error", l.t("settings.namespace_invalid"))
+		s.setFlash(w, r, "error", l.t("settings.namespace_invalid"))
 		http.Redirect(w, r, "/settings", http.StatusSeeOther)
 		return
 	}
@@ -1712,14 +1712,14 @@ func (s *Server) saveServerSettings(w http.ResponseWriter, r *http.Request) {
 	enablingPool := poolEnabled == "1" && (!oldCfg.PoolEnabled || poolName != oldCfg.PoolName)
 	if enablingPool {
 		if _, err := s.Store.GetBucket(ctx, poolName); err == nil {
-			s.setFlash(w, "error", l.t("flash.pool_name_in_use", poolName))
+			s.setFlash(w, r, "error", l.t("flash.pool_name_in_use", poolName))
 			http.Redirect(w, r, "/settings", http.StatusSeeOther)
 			return
 		}
 	}
 	if oldCfg.PoolName != "" && poolName != oldCfg.PoolName {
 		if n, err := s.Store.CountPoolObjects(ctx); err == nil && n > 0 {
-			s.setFlash(w, "error", l.t("flash.pool_rename_blocked", n))
+			s.setFlash(w, r, "error", l.t("flash.pool_rename_blocked", n))
 			http.Redirect(w, r, "/settings", http.StatusSeeOther)
 			return
 		}
@@ -1728,7 +1728,7 @@ func (s *Server) saveServerSettings(w http.ResponseWriter, r *http.Request) {
 		buckets, _ := s.Store.ListBuckets(ctx)
 		pooled, _ := s.Store.CountPoolObjects(ctx)
 		if len(buckets) > 0 || pooled > 0 {
-			s.setFlash(w, "error", l.t("flash.namespace_blocked"))
+			s.setFlash(w, r, "error", l.t("flash.namespace_blocked"))
 			http.Redirect(w, r, "/settings", http.StatusSeeOther)
 			return
 		}
@@ -1745,12 +1745,12 @@ func (s *Server) saveServerSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	for k, v := range pairs {
 		if err := s.Store.SetSetting(ctx, k, v); err != nil {
-			s.setFlash(w, "error", l.errorText(err))
+			s.setFlash(w, r, "error", l.errorText(err))
 			http.Redirect(w, r, "/settings", http.StatusSeeOther)
 			return
 		}
 	}
-	s.setFlash(w, "ok", l.t("flash.settings_saved"))
+	s.setFlash(w, r, "ok", l.t("flash.settings_saved"))
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
 
@@ -1827,7 +1827,7 @@ func (s *Server) setLang(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: "lang", Value: code, Path: "/", MaxAge: 365 * 24 * 60 * 60,
-		SameSite: http.SameSiteLaxMode, Secure: s.secureCookie(r),
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.secureCookie(r),
 	})
 	http.Redirect(w, r, safeNext(r.Referer()), http.StatusSeeOther)
 }

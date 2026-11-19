@@ -561,20 +561,28 @@ func (s *Server) oauthReady(r *http.Request) bool {
 // ---------------------------------------------------------------------------
 // Flash messages
 
-func (s *Server) setFlash(w http.ResponseWriter, kind, text string) {
-	s.setFlashSecret(w, kind, text, "")
+func (s *Server) setFlash(w http.ResponseWriter, r *http.Request, kind, text string) {
+	s.setFlashSecret(w, r, kind, text, "")
 }
 
-func (s *Server) setFlashSecret(w http.ResponseWriter, kind, text, secret string) {
+// setFlashSecret stores a one-shot message. secret can hold a new S3 secret
+// key or a presigned link, so the cookie is Secure whenever the console is
+// served over HTTPS.
+func (s *Server) setFlashSecret(w http.ResponseWriter, r *http.Request, kind, text, secret string) {
 	raw, _ := json.Marshal(flashMessage{Kind: kind, Text: text, Secret: secret})
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, s.flashCookie(r, base64.RawURLEncoding.EncodeToString(raw), 120))
+}
+
+func (s *Server) flashCookie(r *http.Request, value string, maxAge int) *http.Cookie {
+	return &http.Cookie{
 		Name:     "s3drive_flash",
-		Value:    base64.RawURLEncoding.EncodeToString(raw),
+		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   120,
-	})
+		Secure:   s.secureCookie(r),
+		MaxAge:   maxAge,
+	}
 }
 
 func (s *Server) popFlash(w http.ResponseWriter, r *http.Request) *flashMessage {
@@ -582,7 +590,7 @@ func (s *Server) popFlash(w http.ResponseWriter, r *http.Request) *flashMessage 
 	if err != nil || c.Value == "" {
 		return nil
 	}
-	http.SetCookie(w, &http.Cookie{Name: "s3drive_flash", Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(w, s.flashCookie(r, "", -1))
 	raw, err := base64.RawURLEncoding.DecodeString(c.Value)
 	if err != nil {
 		return nil
