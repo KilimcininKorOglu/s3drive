@@ -113,53 +113,61 @@ func (s *Server) authorize(o *opCtx, a *Auth) bool {
 	if k == nil {
 		return true
 	}
-	deny := func() bool {
-		writeS3Error(o.w, o.r, o.reqID, "AccessDenied", "this access key is not allowed to perform this operation", http.StatusForbidden)
-		return false
-	}
 	read := o.r.Method == http.MethodGet || o.r.Method == http.MethodHead
-	if o.bucket == "" {
+	switch {
+	case o.bucket == "":
 		return read
+	case o.key == "":
+		return authorizeBucket(o, k, read)
+	case read:
+		return k.CanRead(o.bucket, o.key) || denyKey(o)
 	}
-	if o.key == "" {
-		if read {
-			if k.Bucket != "" && k.Bucket != o.bucket {
-				return deny()
-			}
-			if k.Prefix != "" && (o.r.URL.Query().Get("uploads") != "" || o.r.URL.Query().Get("list-type") == "2" || o.r.Method == http.MethodGet) {
-				q := o.r.URL.Query()
-				p := q.Get("prefix")
-				if p == "" {
-					q.Set("prefix", k.Prefix)
-					o.r.URL.RawQuery = q.Encode()
-				} else if !strings.HasPrefix(p, k.Prefix) {
-					return deny()
-				}
-			}
-			return true
-		}
-		if o.r.Method == http.MethodPut || o.r.Method == http.MethodDelete {
-			if !k.CanWriteBucket(o.bucket) {
-				return deny()
-			}
-			return true
-		}
-		// DeleteObjects checks each key individually.
-		if hasQuery(o.r, "delete") {
-			return k.Bucket == "" || k.Bucket == o.bucket
-		}
-		return deny()
-	}
+	return k.CanWrite(o.bucket, o.key) || denyKey(o)
+}
+
+// denyKey writes AccessDenied for a key policy violation and returns false.
+func denyKey(o *opCtx) bool {
+	writeS3Error(o.w, o.r, o.reqID, "AccessDenied", "this access key is not allowed to perform this operation", http.StatusForbidden)
+	return false
+}
+
+func authorizeBucket(o *opCtx, k *store.AccessKey, read bool) bool {
 	if read {
-		if !k.CanRead(o.bucket, o.key) {
-			return deny()
-		}
+		return authorizeBucketRead(o, k)
+	}
+	if o.r.Method == http.MethodPut || o.r.Method == http.MethodDelete {
+		return k.CanWriteBucket(o.bucket) || denyKey(o)
+	}
+	// DeleteObjects checks each key individually.
+	if hasQuery(o.r, "delete") {
+		return k.Bucket == "" || k.Bucket == o.bucket
+	}
+	return denyKey(o)
+}
+
+func authorizeBucketRead(o *opCtx, k *store.AccessKey) bool {
+	if k.Bucket != "" && k.Bucket != o.bucket {
+		return denyKey(o)
+	}
+	q := o.r.URL.Query()
+	listing := q.Get("uploads") != "" || q.Get("list-type") == "2" || o.r.Method == http.MethodGet
+	if k.Prefix == "" || !listing {
 		return true
 	}
-	if !k.CanWrite(o.bucket, o.key) {
-		return deny()
+	return scopeListPrefix(o, k.Prefix)
+}
+
+// scopeListPrefix narrows a listing to the key's prefix: an empty prefix is
+// replaced with it and a prefix outside it is denied.
+func scopeListPrefix(o *opCtx, keyPrefix string) bool {
+	q := o.r.URL.Query()
+	p := q.Get("prefix")
+	if p == "" {
+		q.Set("prefix", keyPrefix)
+		o.r.URL.RawQuery = q.Encode()
+		return true
 	}
-	return true
+	return strings.HasPrefix(p, keyPrefix) || denyKey(o)
 }
 
 type opCtx struct {
@@ -203,62 +211,69 @@ func (s *Server) bucketRequest(o *opCtx) {
 	case http.MethodHead:
 		s.headBucket(o)
 	case http.MethodPut:
-		if s.bucketSubresource(o) {
-			return
-		}
-		s.createBucket(o)
+		s.unlessSubresource(o, s.createBucket)
 	case http.MethodDelete:
-		if s.bucketSubresource(o) {
-			return
-		}
-		s.deleteBucket(o)
+		s.unlessSubresource(o, s.deleteBucket)
 	case http.MethodGet:
-		if s.bucketSubresource(o) {
-			return
-		}
-		if o.r.URL.Query().Get("uploads") != "" || hasQuery(o.r, "uploads") {
-			s.listMultipartUploads(o)
-			return
-		}
-		s.listObjects(o)
+		s.unlessSubresource(o, s.bucketGet)
 	case http.MethodPost:
 		if hasQuery(o.r, "delete") {
 			s.deleteObjects(o)
 			return
 		}
-		if s.bucketSubresource(o) {
-			return
-		}
-		s.methodNotAllowed(o)
+		s.unlessSubresource(o, s.methodNotAllowed)
 	default:
 		s.methodNotAllowed(o)
 	}
 }
 
+// unlessSubresource runs handle when the request is not a bucket
+// subresource (acl, cors, policy, ...), which bucketSubresource serves.
+func (s *Server) unlessSubresource(o *opCtx, handle func(*opCtx)) {
+	if !s.bucketSubresource(o) {
+		handle(o)
+	}
+}
+
+func (s *Server) bucketGet(o *opCtx) {
+	if o.r.URL.Query().Get("uploads") != "" || hasQuery(o.r, "uploads") {
+		s.listMultipartUploads(o)
+		return
+	}
+	s.listObjects(o)
+}
+
 func (s *Server) objectRequest(o *opCtx) {
-	q := o.r.URL.Query()
 	if hasQuery(o.r, "uploads") && o.r.Method == http.MethodPost {
 		s.createMultipartUpload(o)
 		return
 	}
-	if q.Get("uploadId") != "" {
-		switch o.r.Method {
-		case http.MethodPut:
-			s.uploadPart(o)
-		case http.MethodPost:
-			s.completeMultipartUpload(o)
-		case http.MethodDelete:
-			s.abortMultipartUpload(o)
-		case http.MethodGet:
-			s.listParts(o)
-		default:
-			s.methodNotAllowed(o)
-		}
+	if o.r.URL.Query().Get("uploadId") != "" {
+		s.multipartRequest(o)
 		return
 	}
 	if s.objectSubresource(o) {
 		return
 	}
+	s.plainObjectRequest(o)
+}
+
+func (s *Server) multipartRequest(o *opCtx) {
+	switch o.r.Method {
+	case http.MethodPut:
+		s.uploadPart(o)
+	case http.MethodPost:
+		s.completeMultipartUpload(o)
+	case http.MethodDelete:
+		s.abortMultipartUpload(o)
+	case http.MethodGet:
+		s.listParts(o)
+	default:
+		s.methodNotAllowed(o)
+	}
+}
+
+func (s *Server) plainObjectRequest(o *opCtx) {
 	switch o.r.Method {
 	case http.MethodGet:
 		s.getObject(o)
