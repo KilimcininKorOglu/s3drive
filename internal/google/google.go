@@ -977,83 +977,110 @@ func (c *Client) startResumable(ctx context.Context, acct *store.Account, existi
 func (c *Client) putResumableChunks(ctx context.Context, acct *store.Account, sessionURL string, r io.ReadSeeker, size int64, offset int64, resume *UploadResume) (*File, bool, error) {
 	buf := make([]byte, chunkSize)
 	for offset < size {
-		n := int64(len(buf))
-		if remain := size - offset; remain < n {
-			n = remain
-		}
-		if _, err := io.ReadFull(r, buf[:n]); err != nil {
+		chunk := buf[:min(int64(len(buf)), size-offset)]
+		if _, err := io.ReadFull(r, chunk); err != nil {
 			return nil, false, err
 		}
-
-		var lastErr error
-		for attempt := range 6 {
-			token, err := c.AccessToken(ctx, acct)
-			if err != nil {
-				return nil, false, err
-			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodPut, sessionURL, strings.NewReader(string(buf[:n])))
-			if err != nil {
-				return nil, false, err
-			}
-			req.ContentLength = n
-			req.Header.Set("Authorization", "Bearer "+token)
-			req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+n-1, size))
-			req.Header.Set("Content-Type", "application/octet-stream")
-			resp, err := c.HTTP.Do(req)
-			if err != nil {
-				lastErr = err
-				if ctx.Err() != nil {
-					return nil, false, ctx.Err()
-				}
-				sleepBackoff(ctx, attempt)
-				continue
-			}
-			switch {
-			case resp.StatusCode == 308:
-				if committed := parseRangeOffset(resp.Header.Get("Range")); committed > offset {
-					offset = committed
-				} else {
-					offset += n
-				}
-				_ = resp.Body.Close() // status already read, body not needed
-				if _, err := r.Seek(offset, io.SeekStart); err != nil {
-					return nil, false, err
-				}
-				if err := c.saveResume(ctx, resume, sessionURL, offset); err != nil {
-					return nil, false, err
-				}
-				lastErr = nil
-				goto nextChunk
-			case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
-				defer func() { _ = resp.Body.Close() }() // read-only response body
-				var raw RawFile
-				if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-					return nil, false, err
-				}
-				f := normalizeFile(raw)
-				return &f, false, nil
-			case resp.StatusCode == 401:
-				_ = resp.Body.Close() // status already read, body not needed
-				if _, err := c.ForceRefresh(ctx, acct); err != nil {
-					return nil, false, err
-				}
-			case resp.StatusCode == 403 || resp.StatusCode == 404 || resp.StatusCode == 410:
-				e := readAPIError(resp)
-				return nil, true, e
-			case resp.StatusCode == 429 || resp.StatusCode >= 500:
-				lastErr = readAPIError(resp)
-				sleepBackoff(ctx, attempt)
-			default:
-				e := readAPIError(resp)
-				return nil, false, e
-			}
+		res := c.putChunk(ctx, acct, sessionURL, chunk, offset, size)
+		if res.err != nil || res.file != nil {
+			return res.file, res.restart, res.err
 		}
-		if lastErr != nil {
-			return nil, true, lastErr
+		offset = res.next
+		if _, err := r.Seek(offset, io.SeekStart); err != nil {
+			return nil, false, err
 		}
-	nextChunk:
+		if err := c.saveResume(ctx, resume, sessionURL, offset); err != nil {
+			return nil, false, err
+		}
 	}
 	return nil, true, errors.New("upload finished without a response")
+}
+
+// chunkResult is the outcome of sending one chunk: the next offset Drive
+// expects, or the finished file, or an error. restart asks the caller to
+// begin a new upload session.
+type chunkResult struct {
+	next    int64
+	file    *File
+	err     error
+	restart bool
+}
+
+// putChunk sends one chunk, retrying transport errors, 429/5xx and one token
+// refresh per 401 within six attempts. A chunk that never gets a final
+// answer is an error; it must not fall through to the next chunk, because
+// Drive would then receive bytes at the wrong offset.
+func (c *Client) putChunk(ctx context.Context, acct *store.Account, sessionURL string, chunk []byte, offset, size int64) chunkResult {
+	var lastErr error
+	for attempt := range 6 {
+		resp, transport, err := c.sendChunk(ctx, acct, sessionURL, chunk, offset, size)
+		if err != nil && (!transport || ctx.Err() != nil) {
+			return chunkResult{err: cmp.Or(ctx.Err(), err)}
+		}
+		if err != nil {
+			lastErr = err
+			sleepBackoff(ctx, attempt)
+			continue
+		}
+		res, again := c.readChunkStatus(ctx, acct, resp, offset, int64(len(chunk)), attempt)
+		if !again {
+			return res
+		}
+		lastErr = cmp.Or(res.err, lastErr)
+	}
+	return chunkResult{err: cmp.Or(lastErr, errors.New("chunk upload was not accepted after six attempts")), restart: true}
+}
+
+func (c *Client) sendChunk(ctx context.Context, acct *store.Account, sessionURL string, chunk []byte, offset, size int64) (*http.Response, bool, error) {
+	token, err := c.AccessToken(ctx, acct)
+	if err != nil {
+		return nil, false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, sessionURL, bytes.NewReader(chunk))
+	if err != nil {
+		return nil, false, err
+	}
+	n := int64(len(chunk))
+	req.ContentLength = n
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+n-1, size))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := c.HTTP.Do(req)
+	return resp, err != nil, err
+}
+
+// nextOffset is where the next chunk starts after a 308. Drive may store
+// only part of a chunk, so its Range header wins when it moved past offset;
+// without one the whole chunk counts as stored.
+func nextOffset(rangeHeader string, offset, n int64) int64 {
+	if committed := parseRangeOffset(rangeHeader); committed > offset {
+		return committed
+	}
+	return offset + n
+}
+
+// readChunkStatus maps a chunk response. again asks for another attempt of
+// the same chunk (after a token refresh or a 429/5xx backoff).
+func (c *Client) readChunkStatus(ctx context.Context, acct *store.Account, resp *http.Response, offset, n int64, attempt int) (chunkResult, bool) {
+	switch code := resp.StatusCode; {
+	case code == 308:
+		_ = resp.Body.Close() // status already read, body not needed
+		return chunkResult{next: nextOffset(resp.Header.Get("Range"), offset, n)}, false
+	case code == http.StatusOK || code == http.StatusCreated:
+		f, err := decodeFile(resp)
+		return chunkResult{file: f, err: err}, false
+	case code == http.StatusUnauthorized:
+		_ = resp.Body.Close() // status already read, body not needed
+		_, err := c.ForceRefresh(ctx, acct)
+		return chunkResult{err: err}, err == nil
+	case code == http.StatusForbidden || code == http.StatusNotFound || code == http.StatusGone:
+		return chunkResult{err: readAPIError(resp), restart: true}, false
+	case code == http.StatusTooManyRequests || code >= 500:
+		apiErr := readAPIError(resp)
+		sleepBackoff(ctx, attempt)
+		return chunkResult{err: apiErr}, true
+	}
+	return chunkResult{err: readAPIError(resp)}, false
 }
 
 // ---------------------------------------------------------------------------

@@ -91,6 +91,26 @@ func TestQueryResumable(t *testing.T) {
 	}
 }
 
+// A 308 after a chunk: Drive's Range header names the bytes it stored, which
+// can be fewer than were sent; no header means the whole chunk was stored.
+func TestNextOffset(t *testing.T) {
+	cases := []struct {
+		hdr       string
+		offset, n int64
+		want      int64
+	}{
+		{"bytes=0-149", 100, 100, 150}, // partial chunk stored
+		{"bytes=0-199", 100, 100, 200}, // whole chunk stored
+		{"", 100, 100, 200},            // no header
+		{"bytes=0-49", 100, 100, 200},  // stale header behind offset
+	}
+	for _, c := range cases {
+		if got := nextOffset(c.hdr, c.offset, c.n); got != c.want {
+			t.Errorf("nextOffset(%q, %d, %d) = %d, want %d", c.hdr, c.offset, c.n, got, c.want)
+		}
+	}
+}
+
 func TestDoRetriesIdempotentMethodsAfter5xx(t *testing.T) {
 	srv, calls := flakyServer(t, 1)
 	c, acct := testClient(srv)
