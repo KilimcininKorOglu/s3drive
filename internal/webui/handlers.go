@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"cmp"
 	"context"
 	"crypto/md5" // #nosec G501 -- S3 ETag checksum, not a security primitive
 	"crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"net"
@@ -1664,89 +1666,123 @@ func (s *Server) saveOAuthSettings(w http.ResponseWriter, r *http.Request) {
 func (s *Server) saveServerSettings(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
 	ctx := r.Context()
-	publicURL := strings.TrimRight(strings.TrimSpace(r.FormValue("public_url")), "/")
-	if publicURL != "" {
-		u, err := url.Parse(publicURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			s.setFlash(w, r, "error", l.t("settings.public_url_invalid"))
-			http.Redirect(w, r, "/settings", http.StatusSeeOther)
-			return
-		}
-	}
-	region := strings.TrimSpace(r.FormValue("region"))
-	if region == "" {
-		region = "us-east-1"
-	}
-	poolName := strings.ToLower(strings.TrimSpace(r.FormValue("pool_name")))
-	if poolName == "" {
-		poolName = "pool"
-	}
-	if !drive.ValidBucketName(poolName) {
-		s.setFlash(w, r, "error", l.t("flash.invalid_bucket"))
-		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+	pairs, msg := parseServerSettings(r, l)
+	if msg != "" {
+		s.flashRedirect(w, r, msg, "/settings")
 		return
 	}
-	siteName := strings.TrimSpace(r.FormValue("site_name"))
-	if siteName == "" {
-		siteName = "s3drive"
-	}
-	namespace := strings.TrimSpace(r.FormValue("namespace"))
-	if namespace == "" {
-		namespace = "s3drive"
-	}
-	if strings.ContainsAny(namespace, `/\`) || len(namespace) > 200 {
-		s.setFlash(w, r, "error", l.t("settings.namespace_invalid"))
-		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+	msg, err := s.settingsChangeBlocked(ctx, l, pairs)
+	if err != nil {
+		s.flashRedirect(w, r, l.errorText(err), "/settings")
 		return
 	}
-	poolEnabled := "0"
-	if r.FormValue("pool_enabled") == "1" {
-		poolEnabled = "1"
-	}
-	oldCfg, _ := s.Svc.LoadSettings(ctx)
-	enablingPool := poolEnabled == "1" && (!oldCfg.PoolEnabled || poolName != oldCfg.PoolName)
-	if enablingPool {
-		if _, err := s.Store.GetBucket(ctx, poolName); err == nil {
-			s.setFlash(w, r, "error", l.t("flash.pool_name_in_use", poolName))
-			http.Redirect(w, r, "/settings", http.StatusSeeOther)
-			return
-		}
-	}
-	if oldCfg.PoolName != "" && poolName != oldCfg.PoolName {
-		if n, err := s.Store.CountPoolObjects(ctx); err == nil && n > 0 {
-			s.setFlash(w, r, "error", l.t("flash.pool_rename_blocked", n))
-			http.Redirect(w, r, "/settings", http.StatusSeeOther)
-			return
-		}
-	}
-	if oldCfg.Namespace != "" && namespace != oldCfg.Namespace {
-		buckets, _ := s.Store.ListBuckets(ctx)
-		pooled, _ := s.Store.CountPoolObjects(ctx)
-		if len(buckets) > 0 || pooled > 0 {
-			s.setFlash(w, r, "error", l.t("flash.namespace_blocked"))
-			http.Redirect(w, r, "/settings", http.StatusSeeOther)
-			return
-		}
-		_ = s.Store.ClearNamespaceIDs(ctx)
-	}
-	pairs := map[string]string{
-		drive.SettingPublicURL:   publicURL,
-		drive.SettingRegion:      region,
-		drive.SettingPoolName:    poolName,
-		drive.SettingPoolEnabled: poolEnabled,
-		drive.SettingCORS:        strings.TrimSpace(r.FormValue("cors_origins")),
-		drive.SettingSiteName:    siteName,
-		drive.SettingNamespace:   namespace,
+	if msg != "" {
+		s.flashRedirect(w, r, msg, "/settings")
+		return
 	}
 	for k, v := range pairs {
 		if err := s.Store.SetSetting(ctx, k, v); err != nil {
-			s.setFlash(w, r, "error", l.errorText(err))
-			http.Redirect(w, r, "/settings", http.StatusSeeOther)
+			s.flashRedirect(w, r, l.errorText(err), "/settings")
 			return
 		}
 	}
 	s.setFlash(w, r, "ok", l.t("flash.settings_saved"))
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
+}
+
+// parseServerSettings validates the settings form and fills defaults. msg is
+// the translated error for an invalid field.
+func parseServerSettings(r *http.Request, l *lang) (pairs map[string]string, msg string) {
+	publicURL := strings.TrimRight(strings.TrimSpace(r.FormValue("public_url")), "/")
+	if !validPublicURL(publicURL) {
+		return nil, l.t("settings.public_url_invalid")
+	}
+	poolName := cmp.Or(strings.ToLower(strings.TrimSpace(r.FormValue("pool_name"))), "pool")
+	if !drive.ValidBucketName(poolName) {
+		return nil, l.t("flash.invalid_bucket")
+	}
+	namespace := cmp.Or(strings.TrimSpace(r.FormValue("namespace")), "s3drive")
+	if strings.ContainsAny(namespace, `/\`) || len(namespace) > 200 {
+		return nil, l.t("settings.namespace_invalid")
+	}
+	poolEnabled := "0"
+	if r.FormValue("pool_enabled") == "1" {
+		poolEnabled = "1"
+	}
+	return map[string]string{
+		drive.SettingPublicURL:   publicURL,
+		drive.SettingRegion:      cmp.Or(strings.TrimSpace(r.FormValue("region")), "us-east-1"),
+		drive.SettingPoolName:    poolName,
+		drive.SettingPoolEnabled: poolEnabled,
+		drive.SettingCORS:        strings.TrimSpace(r.FormValue("cors_origins")),
+		drive.SettingSiteName:    cmp.Or(strings.TrimSpace(r.FormValue("site_name")), "s3drive"),
+		drive.SettingNamespace:   namespace,
+	}, ""
+}
+
+// validPublicURL accepts an empty value or an absolute http(s) URL.
+func validPublicURL(v string) bool {
+	if v == "" {
+		return true
+	}
+	u, err := url.Parse(v)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
+// settingsChangeBlocked enforces the pool and namespace guards (AGENTS.md:
+// the pool name stays reserved; the namespace cannot move while data
+// exists). A store error blocks the change instead of skipping the guard.
+func (s *Server) settingsChangeBlocked(ctx context.Context, l *lang, pairs map[string]string) (string, error) {
+	oldCfg, err := s.Svc.LoadSettings(ctx)
+	if err != nil {
+		return "", err
+	}
+	poolName := pairs[drive.SettingPoolName]
+	enablingPool := pairs[drive.SettingPoolEnabled] == "1" && (!oldCfg.PoolEnabled || poolName != oldCfg.PoolName)
+	if msg, err := s.poolNameBlocked(ctx, l, poolName, enablingPool, oldCfg.PoolName); msg != "" || err != nil {
+		return msg, err
+	}
+	if oldCfg.Namespace == "" || pairs[drive.SettingNamespace] == oldCfg.Namespace {
+		return "", nil
+	}
+	return s.namespaceChangeBlocked(ctx, l)
+}
+
+func (s *Server) poolNameBlocked(ctx context.Context, l *lang, poolName string, enabling bool, oldName string) (string, error) {
+	if enabling {
+		_, err := s.Store.GetBucket(ctx, poolName)
+		if err == nil {
+			return l.t("flash.pool_name_in_use", poolName), nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return "", err
+		}
+	}
+	if oldName == "" || poolName == oldName {
+		return "", nil
+	}
+	n, err := s.Store.CountPoolObjects(ctx)
+	if err != nil || n == 0 {
+		return "", err
+	}
+	return l.t("flash.pool_rename_blocked", n), nil
+}
+
+// namespaceChangeBlocked allows a namespace move only while no bucket or
+// pooled object exists, then drops the cached namespace folder ids.
+func (s *Server) namespaceChangeBlocked(ctx context.Context, l *lang) (string, error) {
+	buckets, err := s.Store.ListBuckets(ctx)
+	if err != nil {
+		return "", err
+	}
+	pooled, err := s.Store.CountPoolObjects(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(buckets) > 0 || pooled > 0 {
+		return l.t("flash.namespace_blocked"), nil
+	}
+	return "", s.Store.ClearNamespaceIDs(ctx)
 }
 
 // ---------------------------------------------------------------------------
