@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -199,30 +200,55 @@ func maintenance(ctx context.Context, st *store.Store, spoolDir string, log *slo
 	}
 }
 
+// cleanupSpool removes spool files older than maxAge. It works inside an
+// os.Root so a symlink placed in the spool cannot redirect a removal outside.
 func cleanupSpool(dir string, maxAge time.Duration, log *slog.Logger) {
-	cutoff := time.Now().Add(-maxAge)
-	var removed int64
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() || path == dir {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil || info.ModTime().After(cutoff) {
-			return nil
-		}
-		if err := os.Remove(path); err == nil {
-			removed += info.Size()
-		}
-		return nil
-	})
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		log.Warn("clean spool", "err", err)
+		return
+	}
+	defer closeLogged(root, "spool root", log)
+	removed, err := removeStale(root, time.Now().Add(-maxAge), log)
 	if err != nil {
 		log.Warn("clean spool", "err", err)
 		return
 	}
 	if removed > 0 {
 		log.Info("cleaned stale spool files", "bytes", removed)
+	}
+}
+
+func removeStale(root *os.Root, cutoff time.Time, log *slog.Logger) (int64, error) {
+	var removed int64
+	err := fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			log.Warn("clean spool entry", "path", path, "err", err)
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			log.Warn("clean spool entry", "path", path, "err", err)
+			return nil
+		}
+		if info.ModTime().After(cutoff) {
+			return nil
+		}
+		if err := root.Remove(path); err != nil {
+			log.Warn("remove spool file", "path", path, "err", err)
+			return nil
+		}
+		removed += info.Size()
+		return nil
+	})
+	return removed, err
+}
+
+func closeLogged(c io.Closer, what string, log *slog.Logger) {
+	if err := c.Close(); err != nil {
+		log.Warn("close", "what", what, "err", err)
 	}
 }
