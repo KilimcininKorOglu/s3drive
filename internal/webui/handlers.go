@@ -333,7 +333,8 @@ func (s *Server) buildFiles(r *http.Request, b baseData, bucket, prefix, afterTo
 		parts := strings.Split(strings.TrimSuffix(prefix, "/"), "/")
 		var cumulative strings.Builder
 		for i, part := range parts {
-			cumulative.WriteString(part + "/")
+			cumulative.WriteString(part)
+			cumulative.WriteByte('/')
 			data.Crumbs = append(data.Crumbs, crumbView{Name: part, Prefix: cumulative.String(), Last: i == len(parts)-1})
 		}
 	}

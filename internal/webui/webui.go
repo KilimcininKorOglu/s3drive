@@ -215,7 +215,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !public && !s.isAuthed(r) {
 		next := r.URL.RequestURI()
-		http.Redirect(w, r, "/login?next="+urlQuery(next), http.StatusSeeOther)
+		http.Redirect(w, r, "/login?next="+urlQuery(next), http.StatusSeeOther) // #nosec G710 -- fixed /login path; next is percent-encoded
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
