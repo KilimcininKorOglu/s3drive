@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -382,49 +383,55 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		s.filePartial(w, r, bucket, prefix, &flashMessage{Kind: "error", Text: l.t("flash.error", l.t("files.choose"))})
 		return
 	}
-	ok, failed := 0, 0
-	var firstErr error
+	var batch uploadBatch
 	for _, fh := range headers {
-		name := sanitizeName(fh.Filename)
-		if name == "" {
-			continue
+		if name := sanitizeName(fh.Filename); name != "" {
+			batch.put(r.Context(), s.Svc, bucket, prefix+name, fh)
 		}
-		key := prefix + name
-		f, err := fh.Open()
-		if err != nil {
-			failed++
-			firstErr = err
-			continue
-		}
-		ct := fh.Header.Get("Content-Type")
-		if ct == "" {
-			ct = mime.TypeByExtension(filepath.Ext(name))
-		}
-		if ct == "" {
-			ct = "application/octet-stream"
-		}
-		_, err = s.Svc.Put(r.Context(), bucket, key, ct, f)
-		_ = f.Close() // read-only upload source; Put/Copy reported read errors
-		if err != nil {
-			failed++
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		ok++
 	}
-	var notice *flashMessage
-	if failed > 0 {
-		text := l.errorText(firstErr)
-		if ok > 0 {
-			text = l.t("flash.uploaded", ok) + " — " + text
-		}
-		notice = &flashMessage{Kind: "error", Text: text}
-	} else {
-		notice = &flashMessage{Kind: "ok", Text: l.t("flash.uploaded", ok)}
+	s.filePartial(w, r, bucket, prefix, batch.notice(l))
+}
+
+// uploadBatch uploads form files one by one and keeps the first error.
+type uploadBatch struct {
+	ok, failed int
+	firstErr   error
+}
+
+func (b *uploadBatch) put(ctx context.Context, svc *drive.Service, bucket, key string, fh *multipart.FileHeader) {
+	err := putFormFile(ctx, svc, bucket, key, fh)
+	if err == nil {
+		b.ok++
+		return
 	}
-	s.filePartial(w, r, bucket, prefix, notice)
+	b.failed++
+	if b.firstErr == nil {
+		b.firstErr = err
+	}
+}
+
+func putFormFile(ctx context.Context, svc *drive.Service, bucket, key string, fh *multipart.FileHeader) error {
+	f, err := fh.Open()
+	if err != nil {
+		return err
+	}
+	ct := cmp.Or(fh.Header.Get("Content-Type"), mime.TypeByExtension(filepath.Ext(key)), "application/octet-stream")
+	_, err = svc.Put(ctx, bucket, key, ct, f)
+	_ = f.Close() // read-only upload source; Put reported read errors
+	return err
+}
+
+// notice reports the uploaded count, or the first error (with the count of
+// files that did upload).
+func (b *uploadBatch) notice(l *lang) *flashMessage {
+	if b.failed == 0 {
+		return &flashMessage{Kind: "ok", Text: l.t("flash.uploaded", b.ok)}
+	}
+	text := l.errorText(b.firstErr)
+	if b.ok > 0 {
+		text = l.t("flash.uploaded", b.ok) + " — " + text
+	}
+	return &flashMessage{Kind: "error", Text: text}
 }
 
 func cleanRelPath(name string) string {
@@ -462,51 +469,17 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 		s.filePartial(w, r, bucket, prefix, &flashMessage{Kind: "error", Text: l.t("flash.no_selection")})
 		return
 	}
-	ok, failed := 0, 0
-	var firstErr error
+	var batch uploadBatch
 	for i, fh := range headers {
 		rel := fh.Filename
 		if i < len(rels) && strings.TrimSpace(rels[i]) != "" {
 			rel = rels[i]
 		}
-		rel = cleanRelPath(rel)
-		if rel == "" {
-			continue
+		if rel = cleanRelPath(rel); rel != "" {
+			batch.put(r.Context(), s.Svc, bucket, prefix+rel, fh)
 		}
-		f, err := fh.Open()
-		if err != nil {
-			failed++
-			firstErr = err
-			continue
-		}
-		ct := fh.Header.Get("Content-Type")
-		if ct == "" {
-			ct = mime.TypeByExtension(filepath.Ext(rel))
-		}
-		if ct == "" {
-			ct = "application/octet-stream"
-		}
-		_, err = s.Svc.Put(r.Context(), bucket, prefix+rel, ct, f)
-		_ = f.Close() // read-only upload source; Put/Copy reported read errors
-		if err != nil {
-			failed++
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		ok++
 	}
-	var notice *flashMessage
-	if failed > 0 {
-		notice = &flashMessage{Kind: "error", Text: l.errorText(firstErr)}
-		if ok > 0 {
-			notice.Text = l.t("flash.uploaded", ok) + " — " + notice.Text
-		}
-	} else {
-		notice = &flashMessage{Kind: "ok", Text: l.t("flash.uploaded", ok)}
-	}
-	s.filePartial(w, r, bucket, prefix, notice)
+	s.filePartial(w, r, bucket, prefix, batch.notice(l))
 }
 
 const (
