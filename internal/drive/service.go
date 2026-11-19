@@ -332,7 +332,7 @@ func (s *Service) DeleteBucket(ctx context.Context, name string) error {
 	if err := s.Google.Delete(ctx, ref.Account, ref.FolderID); err != nil && !isGoogleNotFound(err) {
 		return err
 	}
-	_ = s.Store.ForgetFolder(ctx, ref.Account.ID, ref.FolderID)
+	s.logStoreErr("forget folder cache", name, s.Store.ForgetFolder(ctx, ref.Account.ID, ref.FolderID))
 	return s.Store.DeleteBucket(ctx, name)
 }
 
@@ -376,10 +376,12 @@ func (s *Service) RenameBucket(ctx context.Context, oldName, newName string) err
 		return err
 	}
 	if _, err := s.Google.Rename(ctx, ref.Account, ref.FolderID, encodeSegment(newName)); err != nil {
-		_ = s.Store.RenameBucket(ctx, newName, oldName)
+		if rerr := s.Store.RenameBucket(ctx, newName, oldName); rerr != nil {
+			return errors.Join(err, fmt.Errorf("roll back bucket rename: %w", rerr))
+		}
 		return err
 	}
-	_ = s.Store.ClearFolderCache(ctx, ref.Account.ID)
+	s.logStoreErr("clear folder cache", newName, s.Store.ClearFolderCache(ctx, ref.Account.ID))
 	return nil
 }
 
@@ -428,7 +430,7 @@ func (s *Service) rootID(ctx context.Context, acct *store.Account) (string, erro
 	s.mu.Lock()
 	s.roots[acct.ID] = root
 	s.mu.Unlock()
-	_ = s.Store.SetAccountRoot(ctx, acct.ID, root)
+	s.logStoreErr("cache account root", acct.ID, s.Store.SetAccountRoot(ctx, acct.ID, root))
 	acct.RootID = root
 	return root, nil
 }
@@ -492,7 +494,7 @@ func (s *Service) ensureOwnedFolder(ctx context.Context, acct *store.Account, pa
 		return "", newError("AccessDenied",
 			"Drive folder %q already exists but was not created by s3drive; refusing to expose it", name)
 	}
-	_ = s.Store.CacheFolder(ctx, acct.ID, parentID, name, f.ID)
+	s.logStoreErr("cache folder", name, s.Store.CacheFolder(ctx, acct.ID, parentID, name, f.ID))
 	return f.ID, nil
 }
 
@@ -563,7 +565,7 @@ func (s *Service) ensureFolder(ctx context.Context, acct *store.Account, parentI
 		if err != nil {
 			return "", err
 		}
-		_ = s.Store.CacheFolder(ctx, acct.ID, current, diskName, f.ID)
+		s.logStoreErr("cache folder", diskName, s.Store.CacheFolder(ctx, acct.ID, current, diskName, f.ID))
 		current = f.ID
 	}
 	return current, nil
@@ -583,7 +585,7 @@ func (s *Service) findFolder(ctx context.Context, acct *store.Account, parentID 
 		unlock := s.lockFolder(acct.ID + ":" + current + ":" + diskName)
 		f, err := s.Google.FindChild(ctx, acct, current, diskName, true)
 		if err == nil {
-			_ = s.Store.CacheFolder(ctx, acct.ID, current, diskName, f.ID)
+			s.logStoreErr("cache folder", diskName, s.Store.CacheFolder(ctx, acct.ID, current, diskName, f.ID))
 		}
 		unlock()
 		if err != nil {

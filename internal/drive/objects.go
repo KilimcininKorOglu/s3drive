@@ -106,12 +106,18 @@ func (s *Service) putFile(ctx context.Context, bucketName, key, contentType, pat
 	if err != nil {
 		return nil, err
 	}
-	_ = s.Store.AddUploadUsage(ctx, acct.ID, size)
+	if err := s.Store.AddUploadUsage(ctx, acct.ID, size); err != nil {
+		s.Log.Warn("record daily upload usage", "account", acct.ID, "err", err)
+	}
 
 	if ref.Pool {
-		_ = s.Store.PutPoolObject(ctx, store.PoolObject{
+		// The index must point at the new file before the old copy goes;
+		// otherwise the key would resolve to a deleted file.
+		if err := s.Store.PutPoolObject(ctx, store.PoolObject{
 			Key: key, AccountID: acct.ID, FileID: uploaded.ID, Size: size,
-		})
+		}); err != nil {
+			return nil, fmt.Errorf("update pool index: %w", err)
+		}
 		// The key moved to another file/account; drop the stale copy so it
 		// does not consume quota or reappear when the index is rebuilt.
 		s.dropStalePoolCopy(ctx, key, previous, uploaded.ID)
@@ -291,7 +297,7 @@ func (s *Service) locate(ctx context.Context, bucketName, key string) (*store.Ac
 				return acct, f, nil
 			}
 		}
-		_ = s.Store.DeletePoolObject(ctx, key)
+		s.logStoreErr("drop stale pool index entry", key, s.Store.DeletePoolObject(ctx, key))
 	}
 
 	accounts, err := s.Store.ListAccounts(ctx)
@@ -311,7 +317,8 @@ func (s *Service) locate(ctx context.Context, bucketName, key string) (*store.Ac
 		if err != nil {
 			continue
 		}
-		_ = s.Store.PutPoolObject(ctx, store.PoolObject{Key: key, AccountID: acct.ID, FileID: f.ID, Size: f.Size})
+		s.logStoreErr("repair pool index entry", key,
+			s.Store.PutPoolObject(ctx, store.PoolObject{Key: key, AccountID: acct.ID, FileID: f.ID, Size: f.Size}))
 		return acct, f, nil
 	}
 	return nil, nil, newError("NoSuchKey", "object %q does not exist", key)
@@ -341,9 +348,28 @@ func (s *Service) Rename(ctx context.Context, bucketName, key, newName string) e
 	if _, err := s.Google.Rename(ctx, acct, f.ID, diskName); err != nil {
 		return err
 	}
-	_ = s.Store.RenameObjectMeta(ctx, bucketName, key, newKey)
-	_ = s.Store.RenamePoolObject(ctx, key, newKey)
+	return s.renameIndexes(ctx, bucketName, key, newKey)
+}
+
+// renameIndexes moves the SQLite metadata and pool index entry to newKey
+// after Drive renamed the file. A failure is returned: the object would
+// otherwise lose its ETag or stay indexed under the old key.
+func (s *Service) renameIndexes(ctx context.Context, bucketName, key, newKey string) error {
+	if err := s.Store.RenameObjectMeta(ctx, bucketName, key, newKey); err != nil {
+		return fmt.Errorf("rename object metadata: %w", err)
+	}
+	if err := s.Store.RenamePoolObject(ctx, key, newKey); err != nil {
+		return fmt.Errorf("rename pool index entry: %w", err)
+	}
 	return nil
+}
+
+// logStoreErr records a failed best-effort store update (caches, repair of
+// an index that self-heals on the next lookup, usage counters).
+func (s *Service) logStoreErr(what, key string, err error) {
+	if err != nil {
+		s.Log.Warn(what, "key", key, "err", err)
+	}
 }
 
 // Move moves an object to another key in the same bucket.
@@ -396,11 +422,14 @@ func (s *Service) Move(ctx context.Context, bucketName, key, newKey string) erro
 	}
 	if _, err := s.Google.Move(ctx, acct, f.ID, parent); err != nil {
 		// Best-effort rollback keeps the Drive name and the S3 key in sync.
-		_, _ = s.Google.Rename(ctx, acct, f.ID, f.Name)
+		if _, rerr := s.Google.Rename(ctx, acct, f.ID, f.Name); rerr != nil {
+			return errors.Join(err, fmt.Errorf("roll back rename: %w", rerr))
+		}
 		return err
 	}
-	_ = s.Store.RenameObjectMeta(ctx, bucketName, key, newKey)
-	_ = s.Store.RenamePoolObject(ctx, key, newKey)
+	if err := s.renameIndexes(ctx, bucketName, key, newKey); err != nil {
+		return err
+	}
 	if ref.Pool {
 		s.dropStalePoolCopy(ctx, newKey, previousPool, f.ID)
 	}
@@ -437,10 +466,13 @@ func (s *Service) Delete(ctx context.Context, bucketName, key string) error {
 	if err := s.Google.Delete(ctx, acct, f.ID); err != nil && !isGoogleNotFound(err) {
 		return err
 	}
-	_ = s.Store.DeletePoolObject(ctx, key)
-	_ = s.Store.DeleteObjectMeta(ctx, bucketName, key)
-	_ = s.Store.DeleteDriveSession(ctx, bucketName, key)
-	return nil
+	// The Drive file is gone; stale rows would keep an old ETag, pool entry
+	// or upload session for the key, so their failures are returned.
+	return errors.Join(
+		s.Store.DeletePoolObject(ctx, key),
+		s.Store.DeleteObjectMeta(ctx, bucketName, key),
+		s.Store.DeleteDriveSession(ctx, bucketName, key),
+	)
 }
 
 // DeleteEmptyFolder removes a folder after its contents have been deleted.
@@ -502,7 +534,7 @@ func (s *Service) deleteFolderIn(ctx context.Context, acct *store.Account, base 
 	if err := s.Google.Delete(ctx, acct, folderID); err != nil && !isGoogleNotFound(err) {
 		return err
 	}
-	_ = s.Store.ForgetFolder(ctx, acct.ID, folderID)
+	s.logStoreErr("forget folder cache", name, s.Store.ForgetFolder(ctx, acct.ID, folderID))
 	return nil
 }
 
@@ -639,13 +671,18 @@ func (s *Service) Copy(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey
 			// Copy first, then remove the old object. If removal fails, remove
 			// the copy so the previous object is never silently destroyed.
 			if err := s.Google.Delete(ctx, dstAcct, oldID); err != nil && !isGoogleNotFound(err) {
-				_ = s.Google.Delete(ctx, dstAcct, copied.ID)
+				if derr := s.Google.Delete(ctx, dstAcct, copied.ID); derr != nil {
+					return nil, errors.Join(err, fmt.Errorf("remove copy after failed replace: %w", derr))
+				}
 				return nil, err
 			}
 		}
-		_ = s.Store.AddUploadUsage(ctx, dstAcct.ID, copied.Size)
+		s.logStoreErr("record daily upload usage", dstKey, s.Store.AddUploadUsage(ctx, dstAcct.ID, copied.Size))
 		if dstRef.Pool {
-			_ = s.Store.PutPoolObject(ctx, store.PoolObject{Key: dstKey, AccountID: dstAcct.ID, FileID: copied.ID, Size: copied.Size})
+			// Point the index at the copy before dropping the old one.
+			if err := s.Store.PutPoolObject(ctx, store.PoolObject{Key: dstKey, AccountID: dstAcct.ID, FileID: copied.ID, Size: copied.Size}); err != nil {
+				return nil, fmt.Errorf("update pool index: %w", err)
+			}
 			s.dropStalePoolCopy(ctx, dstKey, previousPool, copied.ID)
 		}
 		res := &PutResult{ETag: srcFile.MD5, Size: copied.Size, FileID: copied.ID, AccountID: dstAcct.ID, Modified: copied.Modified}
@@ -686,7 +723,7 @@ func (s *Service) inheritObjectMeta(ctx context.Context, srcBucket, srcKey, dstB
 		m.Metadata = src.Metadata
 		m.Checksum = src.Checksum
 	}
-	_ = s.Store.SetObjectMeta(ctx, m)
+	s.logStoreErr("inherit object metadata", dstKey, s.Store.SetObjectMeta(ctx, m))
 }
 
 // CreateFolder creates an empty folder (UI convenience; S3 has no folders).
