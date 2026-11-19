@@ -3,6 +3,7 @@ package s3
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/md5" // #nosec G501 -- S3 Content-MD5 check, not a security primitive
 	"encoding/base64"
@@ -355,100 +356,123 @@ func (s *Server) deleteBucket(o *opCtx) {
 
 func (s *Server) listObjects(o *opCtx) {
 	q := o.r.URL.Query()
-	prefix := q.Get("prefix")
-	delimiter := q.Get("delimiter")
-	encoding := q.Get("encoding-type")
-	if encoding != "" && encoding != "url" {
-		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid encoding-type", http.StatusBadRequest)
+	p, problem := parseListParams(q)
+	if problem != "" {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", problem, http.StatusBadRequest)
 		return
 	}
-	maxKeys := 1000
-	if v := q.Get("max-keys"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid max-keys", http.StatusBadRequest)
-			return
-		}
-		maxKeys = n
-	}
-	if maxKeys > 1000 {
-		maxKeys = 1000
-	}
-	v2 := q.Get("list-type") == "2"
-	var after string
-	if v2 {
-		if tok := q.Get("continuation-token"); tok != "" {
-			raw, err := base64.RawURLEncoding.DecodeString(tok)
-			if err != nil {
-				writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid continuation token", http.StatusBadRequest)
-				return
-			}
-			after = string(raw)
-		} else {
-			after = q.Get("start-after")
-		}
-	} else {
-		after = q.Get("marker")
-	}
-
-	res, err := s.Svc.List(o.r.Context(), o.bucket, prefix, delimiter, maxKeys, after)
+	res, err := s.Svc.List(o.r.Context(), o.bucket, p.prefix, p.delimiter, p.maxKeys, p.after)
 	if err != nil {
 		s.fail(o, err)
 		return
 	}
-	ref, _ := s.Svc.Bucket(o.r.Context(), o.bucket)
+	ref, _ := s.Svc.Bucket(o.r.Context(), o.bucket) // audit attribution only; List already resolved it
 	if ref != nil && ref.Account != nil {
 		o.acctID = ref.Account.ID
 	}
-
 	out := listBucketResult{
 		Xmlns:        xmlNS,
 		Name:         o.bucket,
-		Prefix:       encodeKey(prefix, encoding),
-		Delimiter:    encodeKey(delimiter, encoding),
-		MaxKeys:      maxKeys,
+		Prefix:       encodeKey(p.prefix, p.encoding),
+		Delimiter:    encodeKey(p.delimiter, p.encoding),
+		MaxKeys:      p.maxKeys,
 		IsTruncated:  res.IsTruncated,
-		EncodingType: encoding,
+		EncodingType: p.encoding,
+		Contents:     listContents(res.Objects, p.encoding, q.Get("fetch-owner") == "true"),
 	}
-	fetchOwner := q.Get("fetch-owner") == "true"
-	for _, obj := range res.Objects {
+	for _, cp := range res.CommonPrefixes {
+		out.CommonPrefixes = append(out.CommonPrefixes, commonPrefix{Prefix: encodeKey(cp, p.encoding)})
+	}
+	setListPaging(&out, p, res, q)
+	writeXML(o.w, http.StatusOK, out)
+}
+
+// listParams holds the validated ListObjects (V1/V2) query.
+type listParams struct {
+	prefix, delimiter, encoding, after string
+	maxKeys                            int
+	v2                                 bool
+}
+
+// parseListParams validates the query; problem is the S3 error message for
+// an invalid value.
+func parseListParams(q url.Values) (p listParams, problem string) {
+	p = listParams{prefix: q.Get("prefix"), delimiter: q.Get("delimiter"), encoding: q.Get("encoding-type"), v2: q.Get("list-type") == "2"}
+	if p.encoding != "" && p.encoding != "url" {
+		return p, "invalid encoding-type"
+	}
+	var ok bool
+	if p.maxKeys, ok = parseMaxKeys(q.Get("max-keys")); !ok {
+		return p, "invalid max-keys"
+	}
+	if p.after, ok = listStart(q, p.v2); !ok {
+		return p, "invalid continuation token"
+	}
+	return p, ""
+}
+
+// parseMaxKeys defaults to and caps at 1000.
+func parseMaxKeys(v string) (int, bool) {
+	if v == "" {
+		return 1000, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return min(n, 1000), true
+}
+
+// listStart returns the key to list after: the decoded V2 continuation
+// token, else V2 start-after, else the V1 marker.
+func listStart(q url.Values, v2 bool) (string, bool) {
+	if !v2 {
+		return q.Get("marker"), true
+	}
+	tok := q.Get("continuation-token")
+	if tok == "" {
+		return q.Get("start-after"), true
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(tok)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
+func listContents(objects []drive.Object, encoding string, fetchOwner bool) []listObject {
+	var out []listObject
+	for _, obj := range objects {
 		item := listObject{
 			Key:          encodeKey(obj.Key, encoding),
 			LastModified: xmlTime(obj.Modified),
 			ETag:         quoteETag(obj.ETag),
 			Size:         obj.Size,
-			StorageClass: obj.StorageClass,
-		}
-		if item.StorageClass == "" {
-			item.StorageClass = "STANDARD"
+			StorageClass: cmp.Or(obj.StorageClass, "STANDARD"),
 		}
 		if fetchOwner {
-			id := obj.AccountID
-			if id == "" {
-				id = "s3drive"
-			}
-			item.Owner = &owner{ID: id, DisplayName: obj.AccountMail}
+			item.Owner = &owner{ID: cmp.Or(obj.AccountID, "s3drive"), DisplayName: obj.AccountMail}
 		}
-		out.Contents = append(out.Contents, item)
+		out = append(out, item)
 	}
-	for _, p := range res.CommonPrefixes {
-		out.CommonPrefixes = append(out.CommonPrefixes, commonPrefix{Prefix: encodeKey(p, encoding)})
-	}
-	if v2 {
-		keyCount := len(res.Objects) + len(res.CommonPrefixes)
-		out.KeyCount = &keyCount
-		out.ContinuationToken = q.Get("continuation-token")
-		out.StartAfter = q.Get("start-after")
+	return out
+}
+
+func setListPaging(out *listBucketResult, p listParams, res *drive.ListResult, q url.Values) {
+	if !p.v2 {
+		out.Marker = encodeKey(p.after, p.encoding)
 		if res.IsTruncated {
-			out.NextContinuationToken = base64.RawURLEncoding.EncodeToString([]byte(res.NextAfter))
+			out.NextMarker = encodeKey(res.NextAfter, p.encoding)
 		}
-	} else {
-		out.Marker = encodeKey(after, encoding)
-		if res.IsTruncated {
-			out.NextMarker = encodeKey(res.NextAfter, encoding)
-		}
+		return
 	}
-	writeXML(o.w, http.StatusOK, out)
+	keyCount := len(res.Objects) + len(res.CommonPrefixes)
+	out.KeyCount = &keyCount
+	out.ContinuationToken = q.Get("continuation-token")
+	out.StartAfter = q.Get("start-after")
+	if res.IsTruncated {
+		out.NextContinuationToken = base64.RawURLEncoding.EncodeToString([]byte(res.NextAfter))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -903,57 +927,70 @@ func (s *Server) bucketSubresource(o *opCtx) bool {
 		writeXML(o.w, http.StatusOK, locationConstraint{Xmlns: xmlNS, Value: o.cfg.Region})
 		return true
 	}
-	switch {
-	case hasQuery(o.r, "versioning"):
-		writeRawXML(o.w, http.StatusOK, `<VersioningConfiguration xmlns="`+xmlNS+`"/>`)
-	case hasQuery(o.r, "acl"):
-		writeRawXML(o.w, http.StatusOK, `<AccessControlPolicy xmlns="`+xmlNS+`"><Owner><ID>s3drive</ID><DisplayName>s3drive</DisplayName></Owner><AccessControlList><Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser"><ID>s3drive</ID><DisplayName>s3drive</DisplayName></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>`)
-	case hasQuery(o.r, "policy"):
-		switch o.r.Method {
-		case http.MethodPut:
-			o.w.WriteHeader(http.StatusNoContent)
-		case http.MethodDelete:
-			o.w.WriteHeader(http.StatusNoContent)
-		default:
-			writeS3Error(o.w, o.r, o.reqID, "NoSuchBucketPolicy", "The bucket policy does not exist", http.StatusNotFound)
-		}
-	case hasQuery(o.r, "cors"):
-		writeRawXML(o.w, http.StatusOK, `<CORSConfiguration xmlns="`+xmlNS+`"/>`)
-	case hasQuery(o.r, "lifecycle"):
-		writeRawXML(o.w, http.StatusOK, `<LifecycleConfiguration xmlns="`+xmlNS+`"/>`)
-	case hasQuery(o.r, "encryption"):
-		writeS3Error(o.w, o.r, o.reqID, "ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found", http.StatusNotFound)
-	case hasQuery(o.r, "tagging"):
-		writeRawXML(o.w, http.StatusOK, `<Tagging xmlns="`+xmlNS+`"><TagSet></TagSet></Tagging>`)
-	case hasQuery(o.r, "object-lock"):
-		writeS3Error(o.w, o.r, o.reqID, "ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket", http.StatusNotFound)
-	case hasQuery(o.r, "replication"):
-		writeS3Error(o.w, o.r, o.reqID, "ReplicationConfigurationNotFoundError", "The replication configuration was not found", http.StatusNotFound)
-	case hasQuery(o.r, "website"):
-		writeS3Error(o.w, o.r, o.reqID, "NoSuchWebsiteConfiguration", "The specified bucket does not have a website configuration", http.StatusNotFound)
-	case hasQuery(o.r, "notification"):
-		writeRawXML(o.w, http.StatusOK, `<NotificationConfiguration xmlns="`+xmlNS+`"/>`)
-	case hasQuery(o.r, "requestPayment"):
-		writeRawXML(o.w, http.StatusOK, `<RequestPaymentConfiguration xmlns="`+xmlNS+`"><Payer>BucketOwner</Payer></RequestPaymentConfiguration>`)
-	case hasQuery(o.r, "logging"):
-		writeRawXML(o.w, http.StatusOK, `<BucketLoggingStatus xmlns="`+xmlNS+`"/>`)
-	case hasQuery(o.r, "accelerate"):
-		writeRawXML(o.w, http.StatusOK, `<AccelerateConfiguration xmlns="`+xmlNS+`"/>`)
-	case hasQuery(o.r, "publicAccessBlock"):
-		writeRawXML(o.w, http.StatusOK, `<PublicAccessBlockConfiguration xmlns="`+xmlNS+`"/>`)
-	case hasQuery(o.r, "ownershipControls"):
-		writeRawXML(o.w, http.StatusOK, `<OwnershipControls xmlns="`+xmlNS+`"/>`)
-	default:
-		switch o.r.Method {
-		case http.MethodPut, http.MethodPost:
-			o.w.WriteHeader(http.StatusOK)
-		case http.MethodDelete:
-			o.w.WriteHeader(http.StatusNoContent)
-		default:
-			writeS3Error(o.w, o.r, o.reqID, "NotImplemented", "this bucket subresource is not supported", http.StatusNotImplemented)
+	for _, sub := range bucketSubresources {
+		if hasQuery(o.r, sub.query) {
+			sub.serve(o)
+			return true
 		}
 	}
+	acceptSubresourceWrite(o)
 	return true
+}
+
+// subresourceReply answers one bucket subresource query. bucketSubresources
+// is ordered: the first query present in the request wins.
+type subresourceReply struct {
+	query string
+	serve func(o *opCtx)
+}
+
+var bucketSubresources = []subresourceReply{
+	{"versioning", rawXMLReply(`<VersioningConfiguration xmlns="` + xmlNS + `"/>`)},
+	{"acl", rawXMLReply(`<AccessControlPolicy xmlns="` + xmlNS + `"><Owner><ID>s3drive</ID><DisplayName>s3drive</DisplayName></Owner><AccessControlList><Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser"><ID>s3drive</ID><DisplayName>s3drive</DisplayName></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>`)},
+	{"policy", bucketPolicyReply},
+	{"cors", rawXMLReply(`<CORSConfiguration xmlns="` + xmlNS + `"/>`)},
+	{"lifecycle", rawXMLReply(`<LifecycleConfiguration xmlns="` + xmlNS + `"/>`)},
+	{"encryption", notFoundReply("ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found")},
+	{"tagging", rawXMLReply(`<Tagging xmlns="` + xmlNS + `"><TagSet></TagSet></Tagging>`)},
+	{"object-lock", notFoundReply("ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket")},
+	{"replication", notFoundReply("ReplicationConfigurationNotFoundError", "The replication configuration was not found")},
+	{"website", notFoundReply("NoSuchWebsiteConfiguration", "The specified bucket does not have a website configuration")},
+	{"notification", rawXMLReply(`<NotificationConfiguration xmlns="` + xmlNS + `"/>`)},
+	{"requestPayment", rawXMLReply(`<RequestPaymentConfiguration xmlns="` + xmlNS + `"><Payer>BucketOwner</Payer></RequestPaymentConfiguration>`)},
+	{"logging", rawXMLReply(`<BucketLoggingStatus xmlns="` + xmlNS + `"/>`)},
+	{"accelerate", rawXMLReply(`<AccelerateConfiguration xmlns="` + xmlNS + `"/>`)},
+	{"publicAccessBlock", rawXMLReply(`<PublicAccessBlockConfiguration xmlns="` + xmlNS + `"/>`)},
+	{"ownershipControls", rawXMLReply(`<OwnershipControls xmlns="` + xmlNS + `"/>`)},
+}
+
+func rawXMLReply(body string) func(*opCtx) {
+	return func(o *opCtx) { writeRawXML(o.w, http.StatusOK, body) }
+}
+
+func notFoundReply(code, message string) func(*opCtx) {
+	return func(o *opCtx) { writeS3Error(o.w, o.r, o.reqID, code, message, http.StatusNotFound) }
+}
+
+func bucketPolicyReply(o *opCtx) {
+	switch o.r.Method {
+	case http.MethodPut, http.MethodDelete:
+		o.w.WriteHeader(http.StatusNoContent)
+	default:
+		writeS3Error(o.w, o.r, o.reqID, "NoSuchBucketPolicy", "The bucket policy does not exist", http.StatusNotFound)
+	}
+}
+
+// acceptSubresourceWrite acknowledges writes to unsupported subresources
+// (intelligent-tiering, inventory) and rejects reads.
+func acceptSubresourceWrite(o *opCtx) {
+	switch o.r.Method {
+	case http.MethodPut, http.MethodPost:
+		o.w.WriteHeader(http.StatusOK)
+	case http.MethodDelete:
+		o.w.WriteHeader(http.StatusNoContent)
+	default:
+		writeS3Error(o.w, o.r, o.reqID, "NotImplemented", "this bucket subresource is not supported", http.StatusNotImplemented)
+	}
 }
 
 func (s *Server) objectSubresource(o *opCtx) bool {
