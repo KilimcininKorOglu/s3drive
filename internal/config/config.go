@@ -53,7 +53,7 @@ type Config struct {
 func Load() (Config, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		cwd = "."
+		return Config{}, fmt.Errorf("resolve working directory: %w", err)
 	}
 
 	c := Config{
@@ -78,58 +78,77 @@ func Load() (Config, error) {
 		LoginLockout:      15 * time.Minute,
 	}
 
-	if c.MaxObjectBytes, err = envBytes("S3DRIVE_MAX_OBJECT_BYTES", c.MaxObjectBytes); err != nil {
+	if err := c.loadLimits(); err != nil {
 		return c, err
 	}
-	if c.DailyUploadBytes, err = envBytes("S3DRIVE_DAILY_UPLOAD_BYTES", c.DailyUploadBytes); err != nil {
-		return c, err
-	}
-	if c.MaxUploadsPerAcct, err = envInt("S3DRIVE_MAX_CONCURRENT_UPLOADS", c.MaxUploadsPerAcct); err != nil {
-		return c, err
-	}
-	if c.DiskReserveBytes, err = envBytes("S3DRIVE_DISK_RESERVE_BYTES", c.DiskReserveBytes); err != nil {
-		return c, err
-	}
-	if c.MaxUIBodyBytes, err = envBytes("S3DRIVE_MAX_UI_BODY_BYTES", c.MaxUIBodyBytes); err != nil {
-		return c, err
-	}
-	if c.ShutdownTimeout, err = envDuration("S3DRIVE_SHUTDOWN_TIMEOUT", c.ShutdownTimeout); err != nil {
-		return c, err
-	}
-	if c.LoginMaxFailures, err = envInt("S3DRIVE_LOGIN_MAX_FAILURES", c.LoginMaxFailures); err != nil {
-		return c, err
-	}
-	if c.LoginWindow, err = envDuration("S3DRIVE_LOGIN_WINDOW", c.LoginWindow); err != nil {
-		return c, err
-	}
-	if c.LoginLockout, err = envDuration("S3DRIVE_LOGIN_LOCKOUT", c.LoginLockout); err != nil {
-		return c, err
-	}
-
-	if v := os.Getenv("S3DRIVE_SPOOL_DIR"); v != "" {
-		c.SpoolDir = v
-	} else {
+	if c.SpoolDir = os.Getenv("S3DRIVE_SPOOL_DIR"); c.SpoolDir == "" {
 		c.SpoolDir = filepath.Join(c.DataDir, "tmp")
 	}
 	if v := os.Getenv("S3DRIVE_TRUST_PROXY"); v != "" {
-		c.TrustProxy, err = strconv.ParseBool(v)
-		if err != nil {
+		if c.TrustProxy, err = strconv.ParseBool(v); err != nil {
 			return c, fmt.Errorf("S3DRIVE_TRUST_PROXY: %w", err)
 		}
 	}
+	return c, c.prepareDirs()
+}
 
+// loadLimits applies the size, concurrency and timing overrides in order and
+// stops at the first invalid value.
+func (c *Config) loadLimits() error {
+	steps := []func() error{
+		func() (err error) {
+			c.MaxObjectBytes, err = envBytes("S3DRIVE_MAX_OBJECT_BYTES", c.MaxObjectBytes)
+			return
+		},
+		func() (err error) {
+			c.DailyUploadBytes, err = envBytes("S3DRIVE_DAILY_UPLOAD_BYTES", c.DailyUploadBytes)
+			return
+		},
+		func() (err error) {
+			c.MaxUploadsPerAcct, err = envInt("S3DRIVE_MAX_CONCURRENT_UPLOADS", c.MaxUploadsPerAcct)
+			return
+		},
+		func() (err error) {
+			c.DiskReserveBytes, err = envBytes("S3DRIVE_DISK_RESERVE_BYTES", c.DiskReserveBytes)
+			return
+		},
+		func() (err error) {
+			c.MaxUIBodyBytes, err = envBytes("S3DRIVE_MAX_UI_BODY_BYTES", c.MaxUIBodyBytes)
+			return
+		},
+		func() (err error) {
+			c.ShutdownTimeout, err = envDuration("S3DRIVE_SHUTDOWN_TIMEOUT", c.ShutdownTimeout)
+			return
+		},
+		func() (err error) {
+			c.LoginMaxFailures, err = envInt("S3DRIVE_LOGIN_MAX_FAILURES", c.LoginMaxFailures)
+			return
+		},
+		func() (err error) { c.LoginWindow, err = envDuration("S3DRIVE_LOGIN_WINDOW", c.LoginWindow); return },
+		func() (err error) { c.LoginLockout, err = envDuration("S3DRIVE_LOGIN_LOCKOUT", c.LoginLockout); return },
+	}
+	for _, step := range steps {
+		if err := step(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// prepareDirs makes DataDir absolute and creates it and the spool dir.
+func (c *Config) prepareDirs() error {
 	abs, err := filepath.Abs(c.DataDir)
 	if err != nil {
-		return c, fmt.Errorf("resolve data dir: %w", err)
+		return fmt.Errorf("resolve data dir: %w", err)
 	}
 	c.DataDir = abs
 	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
-		return c, fmt.Errorf("create data dir: %w", err)
+		return fmt.Errorf("create data dir: %w", err)
 	}
 	if err := os.MkdirAll(c.SpoolDir, 0o700); err != nil { // #nosec G703 -- operator-set S3DRIVE_* path, not client input
-		return c, fmt.Errorf("create spool dir: %w", err)
+		return fmt.Errorf("create spool dir: %w", err)
 	}
-	return c, nil
+	return nil
 }
 
 func env(key, def string) string {
