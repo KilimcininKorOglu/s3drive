@@ -8,10 +8,10 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -88,98 +88,118 @@ func (s *Server) uploadPart(o *opCtx) {
 		s.uploadPartCopy(o, uploadID, partNumber)
 		return
 	}
-	partLimit := s.maxPartBytes()
-	if o.r.ContentLength > partLimit {
-		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "part exceeds the maximum part size", http.StatusRequestEntityTooLarge)
+	dir, ok := s.preparePartUpload(o, uploadID, partNumber)
+	if !ok {
 		return
+	}
+	staged, ok := s.stagePart(o, dir, "part-*", o.r.Body)
+	if !ok {
+		return
+	}
+	if !contentMD5Matches(o.r.Header.Get("Content-MD5"), staged.sum) {
+		s.removeTemp(staged.path)
+		writeS3Error(o.w, o.r, o.reqID, "BadDigest", "the Content-MD5 you specified did not match what we received", http.StatusBadRequest)
+		return
+	}
+	if !s.commitPart(o, uploadID, dir, partNumber, staged) {
+		return
+	}
+	o.w.Header().Set("ETag", quoteETag(staged.sum))
+	o.w.WriteHeader(http.StatusOK)
+}
+
+// preparePartUpload checks the declared part size, spool space and the
+// object limit before any byte is read. It writes the error response itself.
+func (s *Server) preparePartUpload(o *opCtx, uploadID string, partNumber int) (string, bool) {
+	if o.r.ContentLength > s.maxPartBytes() {
+		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "part exceeds the maximum part size", http.StatusRequestEntityTooLarge)
+		return "", false
 	}
 	if err := s.Svc.CheckSpool(); err != nil {
 		s.fail(o, err)
-		return
+		return "", false
 	}
 	dir := s.uploadDir(uploadID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		s.fail(o, err)
-		return
+		return "", false
 	}
 	if o.r.ContentLength > 0 && s.stagedLimitExceeded(o, dir, partNumber, o.r.ContentLength) {
-		return
+		return "", false
 	}
-	path := filepath.Join(dir, strconv.Itoa(partNumber))
-	tmp, err := os.CreateTemp(dir, "part-*")
+	return dir, true
+}
+
+// stagedFile is a part written to a temp file in the upload directory.
+type stagedFile struct {
+	path string
+	sum  string // hex MD5
+	size int64
+}
+
+// stagePart copies at most maxPartBytes from src into a new temp file and
+// hashes it. On failure it removes the file and writes the error response.
+func (s *Server) stagePart(o *opCtx, dir, pattern string, src io.Reader) (stagedFile, bool) {
+	partLimit := s.maxPartBytes()
+	tmp, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		s.fail(o, err)
-		return
+		return stagedFile{}, false
 	}
 	h := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
-	src := io.LimitReader(o.r.Body, partLimit+1)
-	n, copyErr := io.Copy(io.MultiWriter(tmp, h), src)
+	n, copyErr := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(src, partLimit+1))
 	closeErr := tmp.Close()
-	if copyErr == nil && n > partLimit {
+	switch {
+	case copyErr == nil && n > partLimit:
 		s.removeTemp(tmp.Name())
 		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "part exceeds the maximum part size", http.StatusRequestEntityTooLarge)
-		return
-	}
-	if copyErr != nil {
+		return stagedFile{}, false
+	case copyErr != nil || closeErr != nil:
 		s.removeTemp(tmp.Name())
-		s.fail(o, copyErr)
-		return
+		s.fail(o, cmp.Or(copyErr, closeErr))
+		return stagedFile{}, false
 	}
-	if closeErr != nil {
-		s.removeTemp(tmp.Name())
-		s.fail(o, closeErr)
-		return
+	return stagedFile{path: tmp.Name(), sum: hex.EncodeToString(h.Sum(nil)), size: n}, true
+}
+
+// contentMD5Matches reports whether an optional Content-MD5 header (base64)
+// equals the hex MD5 of the received bytes.
+func contentMD5Matches(header, sumHex string) bool {
+	if header == "" {
+		return true
 	}
-	sum := hex.EncodeToString(h.Sum(nil))
-	if v := o.r.Header.Get("Content-MD5"); v != "" {
-		raw, err := base64.StdEncoding.DecodeString(v)
-		if err != nil || len(raw) != 16 || hex.EncodeToString(raw) != sum {
-			s.removeTemp(tmp.Name())
-			writeS3Error(o.w, o.r, o.reqID, "BadDigest", "the Content-MD5 you specified did not match what we received", http.StatusBadRequest)
-			return
-		}
+	raw, err := base64.StdEncoding.DecodeString(header)
+	return err == nil && len(raw) == 16 && hex.EncodeToString(raw) == sumHex
+}
+
+// commitPart re-checks the object limit with the real size and moves the
+// staged file into place as the part. It writes the error response itself.
+func (s *Server) commitPart(o *opCtx, uploadID, dir string, partNumber int, staged stagedFile) bool {
+	if s.stagedLimitExceeded(o, dir, partNumber, staged.size) {
+		s.removeTemp(staged.path)
+		return false
 	}
-	if s.stagedLimitExceeded(o, dir, partNumber, n) {
-		s.removeTemp(tmp.Name())
-		return
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		s.removeTemp(tmp.Name())
+	if err := os.Rename(staged.path, filepath.Join(dir, strconv.Itoa(partNumber))); err != nil {
+		s.removeTemp(staged.path)
 		s.fail(o, err)
-		return
+		return false
 	}
 	s.touchUpload(o, uploadID)
-	o.bytes = n
-	o.w.Header().Set("ETag", quoteETag(sum))
-	o.w.WriteHeader(http.StatusOK)
+	o.bytes = staged.size
+	return true
 }
 
 // uploadPartCopy implements UploadPartCopy by downloading the requested
 // source range and staging it exactly like an uploaded part.
 func (s *Server) uploadPartCopy(o *opCtx, uploadID string, partNumber int) {
-	raw := o.r.Header.Get("x-amz-copy-source")
-	if i := strings.IndexByte(raw, '?'); i >= 0 {
-		raw = raw[:i]
-	}
-	decoded, err := url.PathUnescape(strings.TrimPrefix(raw, "/"))
-	if err != nil {
-		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid x-amz-copy-source", http.StatusBadRequest)
-		return
-	}
-	srcBucket, srcKey := splitFirst(decoded)
-	if srcBucket == "" || srcKey == "" {
-		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid x-amz-copy-source", http.StatusBadRequest)
-		return
-	}
-	if o.keyPolicy != nil && !o.keyPolicy.CanRead(srcBucket, srcKey) {
-		writeS3Error(o.w, o.r, o.reqID, "AccessDenied", "access denied by key policy", http.StatusForbidden)
+	srcBucket, srcKey, ok := copySource(o)
+	if !ok {
 		return
 	}
 	if err := s.Svc.CheckSpool(); err != nil {
 		s.fail(o, err)
 		return
 	}
-	partLimit := s.maxPartBytes()
 	rangeHeader := strings.TrimSpace(o.r.Header.Get("x-amz-copy-source-range"))
 	src, err := s.Svc.Get(o.r.Context(), srcBucket, srcKey, rangeHeader)
 	if err != nil {
@@ -193,45 +213,79 @@ func (s *Server) uploadPartCopy(o *opCtx, uploadID string, partNumber int) {
 		s.fail(o, err)
 		return
 	}
-	tmp, err := os.CreateTemp(dir, "copy-*")
-	if err != nil {
-		s.fail(o, err)
+	staged, ok := s.stagePart(o, dir, "copy-*", src.Body)
+	if !ok || !s.commitPart(o, uploadID, dir, partNumber, staged) {
 		return
 	}
-	h := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
-	n, copyErr := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(src.Body, partLimit+1))
-	closeErr := tmp.Close()
-	if copyErr == nil && n > partLimit {
-		s.removeTemp(tmp.Name())
-		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "part exceeds the maximum part size", http.StatusRequestEntityTooLarge)
-		return
-	}
-	if copyErr != nil || closeErr != nil {
-		s.removeTemp(tmp.Name())
-		if copyErr != nil {
-			s.fail(o, copyErr)
-		} else {
-			s.fail(o, closeErr)
-		}
-		return
-	}
-	sum := hex.EncodeToString(h.Sum(nil))
-	path := filepath.Join(dir, strconv.Itoa(partNumber))
-	if s.stagedLimitExceeded(o, dir, partNumber, n) {
-		s.removeTemp(tmp.Name())
-		return
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		s.removeTemp(tmp.Name())
-		s.fail(o, err)
-		return
-	}
-	s.touchUpload(o, uploadID)
-	o.bytes = n
 	writeXML(o.w, http.StatusOK, copyPartResult{
 		LastModified: xmlTime(time.Now()),
-		ETag:         quoteETag(sum),
+		ETag:         quoteETag(staged.sum),
 	})
+}
+
+// readCompleteRequest decodes the CompleteMultipartUpload body and returns
+// its parts sorted by number. It writes the error response itself.
+func readCompleteRequest(o *opCtx) ([]completePart, bool) {
+	var req completeMultipartRequest
+	if err := xml.NewDecoder(io.LimitReader(o.r.Body, 8<<20)).Decode(&req); err != nil {
+		writeS3Error(o.w, o.r, o.reqID, "MalformedXML", "the XML you provided was not well-formed", http.StatusBadRequest)
+		return nil, false
+	}
+	if len(req.Parts) == 0 {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidRequest", "you must specify at least one part", http.StatusBadRequest)
+		return nil, false
+	}
+	sort.Slice(req.Parts, func(i, j int) bool { return req.Parts[i].PartNumber < req.Parts[j].PartNumber })
+	return req.Parts, true
+}
+
+// assembly accumulates the combined object and its multipart ETag inputs.
+type assembly struct {
+	full       hash.Hash
+	partHashes []byte
+	total      int64
+}
+
+// assembleParts appends every listed part to dst in order, checking for
+// duplicates, missing parts and ETag mismatches. It writes the error
+// response itself.
+func (s *Server) assembleParts(o *opCtx, dir string, parts []completePart, dst io.Writer, a *assembly) bool {
+	seen := map[int]bool{}
+	for _, part := range parts {
+		if part.PartNumber < 1 || seen[part.PartNumber] {
+			writeS3Error(o.w, o.r, o.reqID, "InvalidPart", "part numbers must be unique and positive", http.StatusBadRequest)
+			return false
+		}
+		seen[part.PartNumber] = true
+		if !s.appendPart(o, dir, part, dst, a) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) appendPart(o *opCtx, dir string, part completePart, dst io.Writer, a *assembly) bool {
+	path := filepath.Join(dir, strconv.Itoa(part.PartNumber))
+	f, err := os.Open(path) // #nosec G304 -- spool path: safeUploadID keeps [a-z0-9], part number is an int
+	if err != nil {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidPart", fmt.Sprintf("part %d was not uploaded", part.PartNumber), http.StatusBadRequest)
+		return false
+	}
+	partHash := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
+	n, err := io.Copy(io.MultiWriter(dst, a.full, partHash), f)
+	_ = f.Close() // read-only part file; io.Copy reported read errors
+	if err != nil {
+		s.fail(o, err)
+		return false
+	}
+	expected := strings.Trim(part.ETag, `"`)
+	if expected != "" && !strings.EqualFold(expected, hex.EncodeToString(partHash.Sum(nil))) {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidPart", fmt.Sprintf("part %d ETag does not match", part.PartNumber), http.StatusBadRequest)
+		return false
+	}
+	a.partHashes = append(a.partHashes, partHash.Sum(nil)...)
+	a.total += n
+	return true
 }
 
 func (s *Server) completeMultipartUpload(o *opCtx) {
@@ -242,17 +296,10 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 		return
 	}
 	s.touchUpload(o, uploadID)
-	var req completeMultipartRequest
-	if err := xml.NewDecoder(io.LimitReader(o.r.Body, 8<<20)).Decode(&req); err != nil {
-		writeS3Error(o.w, o.r, o.reqID, "MalformedXML", "the XML you provided was not well-formed", http.StatusBadRequest)
+	parts, ok := readCompleteRequest(o)
+	if !ok {
 		return
 	}
-	if len(req.Parts) == 0 {
-		writeS3Error(o.w, o.r, o.reqID, "InvalidRequest", "you must specify at least one part", http.StatusBadRequest)
-		return
-	}
-	sort.Slice(req.Parts, func(i, j int) bool { return req.Parts[i].PartNumber < req.Parts[j].PartNumber })
-
 	dir := s.uploadDir(uploadID)
 	tmp, err := os.CreateTemp(s.SpoolDir, "complete-*")
 	if err != nil {
@@ -262,54 +309,23 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 	tmpPath := tmp.Name()
 	defer s.removeTemp(tmpPath)
 
-	fullHash := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
-	partHashes := make([]byte, 0, len(req.Parts)*md5.Size)
-	seen := map[int]bool{}
-	var total int64
-	for _, part := range req.Parts {
-		if part.PartNumber < 1 || seen[part.PartNumber] {
-			_ = tmp.Close() // error path: the temp file is removed by the deferred removeTemp
-			writeS3Error(o.w, o.r, o.reqID, "InvalidPart", "part numbers must be unique and positive", http.StatusBadRequest)
-			return
-		}
-		seen[part.PartNumber] = true
-		path := filepath.Join(dir, strconv.Itoa(part.PartNumber))
-		f, err := os.Open(path) // #nosec G304 -- spool path: safeUploadID keeps [a-z0-9], part number is an int
-		if err != nil {
-			_ = tmp.Close() // error path: the temp file is removed by the deferred removeTemp
-			writeS3Error(o.w, o.r, o.reqID, "InvalidPart", fmt.Sprintf("part %d was not uploaded", part.PartNumber), http.StatusBadRequest)
-			return
-		}
-		partHash := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
-		n, err := io.Copy(io.MultiWriter(tmp, fullHash, partHash), f)
-		_ = f.Close() // read-only part file; io.Copy reported read errors
-		if err != nil {
-			_ = tmp.Close() // error path: the temp file is removed by the deferred removeTemp
-			s.fail(o, err)
-			return
-		}
-		expected := strings.Trim(part.ETag, `"`)
-		actual := hex.EncodeToString(partHash.Sum(nil))
-		if expected != "" && !strings.EqualFold(expected, actual) {
-			_ = tmp.Close() // error path: the temp file is removed by the deferred removeTemp
-			writeS3Error(o.w, o.r, o.reqID, "InvalidPart", fmt.Sprintf("part %d ETag does not match", part.PartNumber), http.StatusBadRequest)
-			return
-		}
-		partHashes = append(partHashes, partHash.Sum(nil)...)
-		total += n
+	a := &assembly{full: md5.New(), partHashes: make([]byte, 0, len(parts)*md5.Size)} // #nosec G401 -- S3 ETag checksum
+	if !s.assembleParts(o, dir, parts, tmp, a) {
+		_ = tmp.Close() // error path: the temp file is removed by the deferred removeTemp
+		return
 	}
 	if err := tmp.Close(); err != nil {
 		s.fail(o, err)
 		return
 	}
-
-	if s.Svc.MaxObjectBytes > 0 && total > s.Svc.MaxObjectBytes {
+	if s.Svc.MaxObjectBytes > 0 && a.total > s.Svc.MaxObjectBytes {
 		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
 		return
 	}
-	combined := md5.Sum(partHashes) // #nosec G401 -- S3 multipart ETag format
-	multipartETag := hex.EncodeToString(combined[:]) + "-" + strconv.Itoa(len(req.Parts))
-	res, err := s.Svc.PutFile(o.r.Context(), o.bucket, o.key, upload.ContentType, tmpPath, total, hex.EncodeToString(fullHash.Sum(nil)))
+	total := a.total
+	combined := md5.Sum(a.partHashes) // #nosec G401 -- S3 multipart ETag format
+	multipartETag := hex.EncodeToString(combined[:]) + "-" + strconv.Itoa(len(parts))
+	res, err := s.Svc.PutFile(o.r.Context(), o.bucket, o.key, upload.ContentType, tmpPath, total, hex.EncodeToString(a.full.Sum(nil)))
 	if err != nil {
 		s.fail(o, err)
 		return
