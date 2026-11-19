@@ -1849,8 +1849,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, `{"status":"`+status+`","version":"`+config.Version+`","accounts":`+strconv.Itoa(len(accounts))+`,"needs_reauth":`+strconv.Itoa(needs)+`}`)
 }
 
+// safeNext returns v as a same-origin path, or "/" when v could resolve to
+// another host. Browsers treat "\" as "/" and drop tab/newline characters
+// (WHATWG URL parsing), so any such character rejects the value.
 func safeNext(v string) string {
-	if v == "" {
+	if v == "" || strings.ContainsFunc(v, unsafeRedirectRune) {
 		return "/"
 	}
 	if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
@@ -1864,6 +1867,10 @@ func safeNext(v string) string {
 		return "/"
 	}
 	return v
+}
+
+func unsafeRedirectRune(r rune) bool {
+	return r == '\\' || r < 0x20 || r == 0x7f
 }
 
 func subtleCompare(a, b string) bool {
