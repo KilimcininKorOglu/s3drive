@@ -126,7 +126,7 @@ func Load() (Config, error) {
 	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
 		return c, fmt.Errorf("create data dir: %w", err)
 	}
-	if err := os.MkdirAll(c.SpoolDir, 0o700); err != nil {
+	if err := os.MkdirAll(c.SpoolDir, 0o700); err != nil { // #nosec G703 -- operator-set S3DRIVE_* path, not client input
 		return c, fmt.Errorf("create spool dir: %w", err)
 	}
 	return c, nil

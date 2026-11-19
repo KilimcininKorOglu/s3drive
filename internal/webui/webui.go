@@ -313,7 +313,7 @@ func (s *Server) setSession(w http.ResponseWriter, r *http.Request, userID, role
 	payload := strconv.FormatInt(expiry, 10) + "|" + userID + "|" + role
 	mac := hmac.New(sha256.New, s.sessionKey)
 	mac.Write([]byte(payload))
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- HttpOnly+Lax; Secure follows the request scheme (secureCookie)
 		Name:     "s3drive_session",
 		Value:    payload + "." + hex.EncodeToString(mac.Sum(nil)),
 		Path:     "/",
@@ -325,7 +325,7 @@ func (s *Server) setSession(w http.ResponseWriter, r *http.Request, userID, role
 }
 
 func (s *Server) clearSession(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- HttpOnly+Lax; Secure follows the request scheme (secureCookie)
 		Name: "s3drive_session", Value: "", Path: "/", HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, Secure: s.secureCookie(r), MaxAge: -1,
 	})
@@ -345,7 +345,7 @@ func (s *Server) csrfToken(w http.ResponseWriter, r *http.Request) string {
 	raw := make([]byte, 32)
 	_, _ = rand.Read(raw)
 	token := base64.RawURLEncoding.EncodeToString(raw)
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- HttpOnly+Lax; Secure follows the request scheme (secureCookie)
 		Name:     "s3drive_csrf",
 		Value:    token,
 		Path:     "/",
@@ -576,7 +576,7 @@ func (s *Server) setFlashSecret(w http.ResponseWriter, r *http.Request, kind, te
 }
 
 func (s *Server) flashCookie(r *http.Request, value string, maxAge int) *http.Cookie {
-	return &http.Cookie{
+	return &http.Cookie{ // #nosec G124 -- HttpOnly+Lax; Secure follows the request scheme (secureCookie)
 		Name:     "s3drive_flash",
 		Value:    value,
 		Path:     "/",

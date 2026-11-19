@@ -67,7 +67,7 @@ func (s *Server) oauthStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, google.AuthCodeURL(cfg, state, challenge, loginHint), http.StatusSeeOther)
+	http.Redirect(w, r, google.AuthCodeURL(cfg, state, challenge, loginHint), http.StatusSeeOther) // #nosec G710 -- fixed Google auth endpoint; inputs are query-escaped
 }
 
 // oauthCallback validates the state, exchanges the code, stores the refresh

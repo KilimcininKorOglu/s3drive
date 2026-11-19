@@ -348,7 +348,7 @@ func (s *Server) buildFiles(r *http.Request, b baseData, bucket, prefix, afterTo
 
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // #nosec G120 -- body capped by MaxBytesReader in ServeHTTP; 32 MiB memory bound
 		s.filePartial(w, r, r.FormValue("bucket"), normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: err.Error()})
 		return
 	}
@@ -431,7 +431,7 @@ func cleanRelPath(name string) string {
 
 func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // #nosec G120 -- body capped by MaxBytesReader in ServeHTTP; 32 MiB memory bound
 		s.filePartial(w, r, r.FormValue("bucket"), normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: err.Error()})
 		return
 	}
@@ -1792,20 +1792,20 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if s.openMode() {
 		s.recordLoginSuccess(ip)
 		s.setSession(w, r, "env", "admin")
-		http.Redirect(w, r, safeNext(r.FormValue("next")), http.StatusSeeOther)
+		http.Redirect(w, r, safeNext(r.FormValue("next")), http.StatusSeeOther) // #nosec G710 -- safeNext keeps same-origin paths only
 		return
 	}
 	if s.Cfg.UIPassword != "" && subtleCompare(password, s.Cfg.UIPassword) {
 		s.recordLoginSuccess(ip)
 		s.setSession(w, r, "env", "admin")
-		http.Redirect(w, r, safeNext(r.FormValue("next")), http.StatusSeeOther)
+		http.Redirect(w, r, safeNext(r.FormValue("next")), http.StatusSeeOther) // #nosec G710 -- safeNext keeps same-origin paths only
 		return
 	}
 	if username != "" {
 		if u, err := s.Store.GetUserByUsername(r.Context(), username); err == nil && secure.VerifyPassword(u.PasswordHash, password) {
 			s.recordLoginSuccess(ip)
 			s.setSession(w, r, u.ID, u.Role)
-			http.Redirect(w, r, safeNext(r.FormValue("next")), http.StatusSeeOther)
+			http.Redirect(w, r, safeNext(r.FormValue("next")), http.StatusSeeOther) // #nosec G710 -- safeNext keeps same-origin paths only
 			return
 		}
 	}
@@ -1825,11 +1825,11 @@ func (s *Server) setLang(w http.ResponseWriter, r *http.Request) {
 	if _, ok := langs[code]; !ok {
 		code = "en"
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- HttpOnly+Lax; Secure follows the request scheme (secureCookie)
 		Name: "lang", Value: code, Path: "/", MaxAge: 365 * 24 * 60 * 60,
 		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.secureCookie(r),
 	})
-	http.Redirect(w, r, safeNext(r.Referer()), http.StatusSeeOther)
+	http.Redirect(w, r, safeNext(r.Referer()), http.StatusSeeOther) // #nosec G710 -- safeNext keeps same-origin paths only
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
