@@ -101,12 +101,8 @@ func (s *Server) uploadPart(o *opCtx) {
 		s.fail(o, err)
 		return
 	}
-	if o.r.ContentLength > 0 {
-		if total, err := stagedUploadBytes(dir, strconv.Itoa(partNumber)); err == nil &&
-			s.Svc.MaxObjectBytes > 0 && total+o.r.ContentLength > s.Svc.MaxObjectBytes {
-			writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
-			return
-		}
+	if o.r.ContentLength > 0 && s.stagedLimitExceeded(o, dir, partNumber, o.r.ContentLength) {
+		return
 	}
 	path := filepath.Join(dir, strconv.Itoa(partNumber))
 	tmp, err := os.CreateTemp(dir, "part-*")
@@ -142,10 +138,8 @@ func (s *Server) uploadPart(o *opCtx) {
 			return
 		}
 	}
-	if total, err := stagedUploadBytes(dir, strconv.Itoa(partNumber)); err == nil &&
-		s.Svc.MaxObjectBytes > 0 && total+n > s.Svc.MaxObjectBytes {
+	if s.stagedLimitExceeded(o, dir, partNumber, n) {
 		s.removeTemp(tmp.Name())
-		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
 		return
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
@@ -153,7 +147,7 @@ func (s *Server) uploadPart(o *opCtx) {
 		s.fail(o, err)
 		return
 	}
-	_ = s.Store.TouchUpload(o.r.Context(), uploadID)
+	s.touchUpload(o, uploadID)
 	o.bytes = n
 	o.w.Header().Set("ETag", quoteETag(sum))
 	o.w.WriteHeader(http.StatusOK)
@@ -222,10 +216,8 @@ func (s *Server) uploadPartCopy(o *opCtx, uploadID string, partNumber int) {
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
 	path := filepath.Join(dir, strconv.Itoa(partNumber))
-	if total, err := stagedUploadBytes(dir, strconv.Itoa(partNumber)); err == nil &&
-		s.Svc.MaxObjectBytes > 0 && total+n > s.Svc.MaxObjectBytes {
+	if s.stagedLimitExceeded(o, dir, partNumber, n) {
 		s.removeTemp(tmp.Name())
-		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
 		return
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
@@ -233,7 +225,7 @@ func (s *Server) uploadPartCopy(o *opCtx, uploadID string, partNumber int) {
 		s.fail(o, err)
 		return
 	}
-	_ = s.Store.TouchUpload(o.r.Context(), uploadID)
+	s.touchUpload(o, uploadID)
 	o.bytes = n
 	writeXML(o.w, http.StatusOK, copyPartResult{
 		LastModified: xmlTime(time.Now()),
@@ -248,7 +240,7 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 		s.noSuchUpload(o)
 		return
 	}
-	_ = s.Store.TouchUpload(o.r.Context(), uploadID)
+	s.touchUpload(o, uploadID)
 	var req completeMultipartRequest
 	if err := xml.NewDecoder(io.LimitReader(o.r.Body, 8<<20)).Decode(&req); err != nil {
 		writeS3Error(o.w, o.r, o.reqID, "MalformedXML", "the XML you provided was not well-formed", http.StatusBadRequest)
@@ -321,13 +313,15 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 		s.fail(o, err)
 		return
 	}
-	_ = s.Svc.SetObjectMeta(o.r.Context(), store.ObjectMeta{
+	if err := s.Svc.SetObjectMeta(o.r.Context(), store.ObjectMeta{
 		Bucket: o.bucket, Key: o.key, ETag: multipartETag,
 		ContentType: upload.ContentType, StorageClass: upload.StorageClass,
 		Metadata: upload.Metadata, Checksum: upload.Checksum,
-	})
-	_ = s.Store.DeleteUpload(o.r.Context(), uploadID)
-	_ = os.RemoveAll(dir)
+	}); err != nil {
+		s.fail(o, fmt.Errorf("store object metadata: %w", err))
+		return
+	}
+	s.finishUpload(o, uploadID, dir)
 
 	o.acctID, o.bytes = res.AccountID, total
 	o.w.Header().Set("ETag", quoteETag(multipartETag))
@@ -343,8 +337,13 @@ func (s *Server) abortMultipartUpload(o *opCtx) {
 		s.noSuchUpload(o)
 		return
 	}
-	_ = s.Store.DeleteUpload(o.r.Context(), uploadID)
-	_ = os.RemoveAll(s.uploadDir(uploadID))
+	if err := s.Store.DeleteUpload(o.r.Context(), uploadID); err != nil {
+		s.fail(o, fmt.Errorf("delete upload: %w", err))
+		return
+	}
+	if err := os.RemoveAll(s.uploadDir(uploadID)); err != nil {
+		s.Log.Warn("remove aborted upload parts", "upload", uploadID, "err", err)
+	}
 	o.w.WriteHeader(http.StatusNoContent)
 }
 
@@ -417,7 +416,11 @@ func (s *Server) listParts(o *opCtx) {
 			break
 		}
 		path := filepath.Join(dir, strconv.Itoa(p.n))
-		sum, _ := fileMD5(path)
+		sum, err := fileMD5(path)
+		if err != nil {
+			s.fail(o, fmt.Errorf("hash part %d: %w", p.n, err))
+			return
+		}
 		out.Parts = append(out.Parts, partEntry{
 			PartNumber: p.n, LastModified: xmlTime(p.mod), ETag: quoteETag(sum), Size: p.size,
 		})
@@ -524,6 +527,25 @@ func (s *Server) noSuchUpload(o *opCtx) {
 	writeS3Error(o.w, o.r, o.reqID, "NoSuchUpload", "the specified multipart upload does not exist", http.StatusNotFound)
 }
 
+// touchUpload refreshes the upload's activity time. A failure only risks an
+// early stale-upload cleanup, so it is logged and the request continues.
+func (s *Server) touchUpload(o *opCtx, uploadID string) {
+	if err := s.Store.TouchUpload(o.r.Context(), uploadID); err != nil {
+		s.Log.Warn("touch multipart upload", "upload", uploadID, "err", err)
+	}
+}
+
+// finishUpload drops the upload record and its staged parts after the object
+// was stored. The object is already complete, so failures are logged.
+func (s *Server) finishUpload(o *opCtx, uploadID, dir string) {
+	if err := s.Store.DeleteUpload(o.r.Context(), uploadID); err != nil {
+		s.Log.Warn("delete completed upload", "upload", uploadID, "err", err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		s.Log.Warn("remove completed upload parts", "upload", uploadID, "err", err)
+	}
+}
+
 // removeTemp deletes a spool temp file. A failure leaves data on disk, so it
 // is logged rather than dropped.
 func (s *Server) removeTemp(path string) {
@@ -556,12 +578,35 @@ func stagedUploadBytes(dir, skip string) (int64, error) {
 			continue
 		}
 		info, err := e.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // the part was replaced or removed meanwhile
+		}
 		if err != nil {
-			continue
+			return 0, err
 		}
 		total += info.Size()
 	}
 	return total, nil
+}
+
+// stagedLimitExceeded reports whether adding incoming bytes to the parts
+// already staged in dir would pass the object size limit. It writes the error
+// response itself; a failure to measure the staged parts rejects the request
+// rather than skipping the limit.
+func (s *Server) stagedLimitExceeded(o *opCtx, dir string, partNumber int, incoming int64) bool {
+	if s.Svc.MaxObjectBytes <= 0 {
+		return false
+	}
+	total, err := stagedUploadBytes(dir, strconv.Itoa(partNumber))
+	if err != nil {
+		s.fail(o, fmt.Errorf("measure staged parts: %w", err))
+		return true
+	}
+	if total+incoming > s.Svc.MaxObjectBytes {
+		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
+		return true
+	}
+	return false
 }
 
 func fileMD5(path string) (string, error) {

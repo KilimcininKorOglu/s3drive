@@ -184,10 +184,12 @@ func (o *opCtx) record(s *Server) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = s.Store.AddEvent(ctx, store.Event{
+	if err := s.Store.AddEvent(ctx, store.Event{
 		Op: o.op, Bucket: o.bucket, Key: o.key, AccountID: o.acctID, AccessKey: o.accessKey,
 		Bytes: o.bytes, Status: status, MS: time.Since(o.started).Milliseconds(),
-	})
+	}); err != nil {
+		s.Log.Warn("record audit event", "op", o.op, "err", err)
+	}
 	if status >= 500 {
 		s.Log.Warn("s3 request failed", "op", o.op, "bucket", o.bucket, "key", o.key, "status", status, "ms", time.Since(o.started).Milliseconds())
 	}
@@ -481,7 +483,10 @@ func (s *Server) putObject(o *opCtx) {
 		StorageClass: storageClass, Metadata: userMetadataJSON(o.r),
 		Checksum: drive.ChecksumHeader(expected),
 	}
-	_ = s.Svc.SetObjectMeta(o.r.Context(), meta)
+	if err := s.Svc.SetObjectMeta(o.r.Context(), meta); err != nil {
+		s.fail(o, fmt.Errorf("store object metadata: %w", err))
+		return
+	}
 	o.acctID, o.bytes = res.AccountID, res.Size
 	setChecksumResponse(o, meta.Checksum)
 	o.w.Header().Set("ETag", quoteETag(res.ETag))
@@ -809,7 +814,10 @@ func (s *Server) copyObject(o *opCtx) {
 		meta.StorageClass = strings.ToUpper(strings.TrimSpace(o.r.Header.Get("x-amz-storage-class")))
 		meta.Metadata = userMetadataJSON(o.r)
 	}
-	_ = s.Svc.SetObjectMeta(o.r.Context(), meta)
+	if err := s.Svc.SetObjectMeta(o.r.Context(), meta); err != nil {
+		s.fail(o, fmt.Errorf("store object metadata: %w", err))
+		return
+	}
 	o.acctID = res.AccountID
 	writeXML(o.w, http.StatusOK, copyObjectResult{
 		LastModified: xmlTime(res.Modified),
