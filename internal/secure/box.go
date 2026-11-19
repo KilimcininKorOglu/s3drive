@@ -47,7 +47,7 @@ func masterKey(dataDir, envKey string) ([]byte, error) {
 	}
 
 	path := filepath.Join(dataDir, "master.key")
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- fixed name inside the operator-configured data dir
 	if err == nil {
 		key, decErr := decodeKey(strings.TrimSpace(string(raw)))
 		if decErr != nil {

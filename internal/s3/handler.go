@@ -4,7 +4,7 @@ package s3
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- S3 Content-MD5 check, not a security primitive
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -825,7 +825,7 @@ func (s *Server) deleteObjects(o *opCtx) {
 	}
 	if v := o.r.Header.Get("Content-MD5"); v != "" {
 		raw, derr := base64.StdEncoding.DecodeString(v)
-		sum := md5.Sum(body)
+		sum := md5.Sum(body) // #nosec G401 -- S3 DeleteObjects requires Content-MD5
 		if derr != nil || len(raw) != 16 || !bytes.Equal(raw, sum[:]) {
 			writeS3Error(o.w, o.r, o.reqID, "BadDigest", "the Content-MD5 you specified did not match what we received", http.StatusBadRequest)
 			return

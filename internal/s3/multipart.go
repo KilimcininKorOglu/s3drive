@@ -1,7 +1,7 @@
 package s3
 
 import (
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- S3 ETag checksum, not a security primitive
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
@@ -113,7 +113,7 @@ func (s *Server) uploadPart(o *opCtx) {
 		s.fail(o, err)
 		return
 	}
-	h := md5.New()
+	h := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
 	src := io.LimitReader(o.r.Body, partLimit+1)
 	n, copyErr := io.Copy(io.MultiWriter(tmp, h), src)
 	closeErr := tmp.Close()
@@ -202,7 +202,7 @@ func (s *Server) uploadPartCopy(o *opCtx, uploadID string, partNumber int) {
 		s.fail(o, err)
 		return
 	}
-	h := md5.New()
+	h := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
 	n, copyErr := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(src.Body, partLimit+1))
 	closeErr := tmp.Close()
 	if copyErr == nil && n > partLimit {
@@ -268,7 +268,7 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 
-	fullHash := md5.New()
+	fullHash := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
 	partHashes := make([]byte, 0, len(req.Parts)*md5.Size)
 	seen := map[int]bool{}
 	var total int64
@@ -280,13 +280,13 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 		}
 		seen[part.PartNumber] = true
 		path := filepath.Join(dir, strconv.Itoa(part.PartNumber))
-		f, err := os.Open(path)
+		f, err := os.Open(path) // #nosec G304 -- spool path: safeUploadID keeps [a-z0-9], part number is an int
 		if err != nil {
 			tmp.Close()
 			writeS3Error(o.w, o.r, o.reqID, "InvalidPart", fmt.Sprintf("part %d was not uploaded", part.PartNumber), http.StatusBadRequest)
 			return
 		}
-		partHash := md5.New()
+		partHash := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
 		n, err := io.Copy(io.MultiWriter(tmp, fullHash, partHash), f)
 		f.Close()
 		if err != nil {
@@ -313,7 +313,7 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
 		return
 	}
-	combined := md5.Sum(partHashes)
+	combined := md5.Sum(partHashes) // #nosec G401 -- S3 multipart ETag format
 	multipartETag := hex.EncodeToString(combined[:]) + "-" + strconv.Itoa(len(req.Parts))
 	res, err := s.Svc.PutFile(o.r.Context(), o.bucket, o.key, upload.ContentType, tmpPath, total, hex.EncodeToString(fullHash.Sum(nil)))
 	if err != nil {
@@ -556,12 +556,12 @@ func stagedUploadBytes(dir, skip string) (int64, error) {
 }
 
 func fileMD5(path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- callers pass a part file under uploadDir (sanitized upload ID)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	h := md5.New()
+	h := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}

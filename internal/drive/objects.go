@@ -81,7 +81,7 @@ func (s *Service) putFile(ctx context.Context, bucketName, key, contentType, pat
 		return nil, newError("InvalidArgument", "a folder named %q already exists", name)
 	}
 
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- spool file created by os.CreateTemp, not client input
 	if err != nil {
 		return nil, err
 	}

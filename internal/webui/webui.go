@@ -569,7 +569,9 @@ func (s *Server) setFlash(w http.ResponseWriter, r *http.Request, kind, text str
 // key or a presigned link, so the cookie is Secure whenever the console is
 // served over HTTPS.
 func (s *Server) setFlashSecret(w http.ResponseWriter, r *http.Request, kind, text, secret string) {
-	raw, _ := json.Marshal(flashMessage{Kind: kind, Text: text, Secret: secret})
+	// The secret is shown to the admin once; the cookie is HttpOnly, Secure on
+	// HTTPS and expires after two minutes.
+	raw, _ := json.Marshal(flashMessage{Kind: kind, Text: text, Secret: secret}) // #nosec G117 -- one-shot display of a new key
 	http.SetCookie(w, s.flashCookie(r, base64.RawURLEncoding.EncodeToString(raw), 120))
 }
 

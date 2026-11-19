@@ -3,7 +3,7 @@ package s3
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505 -- S3 x-amz-checksum-sha1 trailer, not a security primitive
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -39,7 +39,7 @@ func newPayloadReader(body io.ReadCloser, auth *Auth, trailerHeader string) io.R
 		case "x-amz-checksum-sha256":
 			c.trailers[name] = sha256.New()
 		case "x-amz-checksum-sha1":
-			c.trailers[name] = sha1.New()
+			c.trailers[name] = sha1.New() // #nosec G401 -- S3 x-amz-checksum-sha1 trailer
 		case "x-amz-checksum-crc32":
 			c.trailers[name] = crc32.NewIEEE()
 		case "x-amz-checksum-crc32c":

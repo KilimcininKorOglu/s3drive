@@ -19,7 +19,7 @@ import (
 // Settings keys shared with the web UI.
 const (
 	SettingClientID     = "oauth_client_id"
-	SettingClientSecret = "oauth_client_secret"
+	SettingClientSecret = "oauth_client_secret" // #nosec G101 -- settings key name, the secret lives encrypted in SQLite
 )
 
 // OAuthConfig is the installed OAuth application.

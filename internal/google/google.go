@@ -20,7 +20,7 @@ import (
 const (
 	driveAPI  = "https://www.googleapis.com/drive/v3"
 	uploadAPI = "https://www.googleapis.com/upload/drive/v3"
-	tokenURL  = "https://oauth2.googleapis.com/token"
+	tokenURL  = "https://oauth2.googleapis.com/token" // #nosec G101 -- public OAuth endpoint URL
 	authURL   = "https://accounts.google.com/o/oauth2/v2/auth"
 
 	// ScopeDrive grants full access to the account's Drive. s3drive needs it

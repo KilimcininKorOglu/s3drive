@@ -2,8 +2,10 @@ package drive
 
 import (
 	"context"
-	"crypto/md5"
-	"crypto/sha1"
+	// MD5 and SHA-1 compute S3 object checksums (ETag, x-amz-checksum-sha1),
+	// not security primitives.
+	"crypto/md5"  // #nosec G501 -- S3 ETag/Content-MD5 checksum
+	"crypto/sha1" // #nosec G505 -- S3 x-amz-checksum-sha1
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -30,9 +32,9 @@ func (s *Service) spoolHashes(r io.Reader) (path string, size int64, sums Checks
 		return "", 0, Checksums{}, err
 	}
 	path = f.Name()
-	hMD5 := md5.New()
+	hMD5 := md5.New() // #nosec G401 -- S3 ETag checksum
 	hSHA256 := sha256.New()
-	hSHA1 := sha1.New()
+	hSHA1 := sha1.New() // #nosec G401 -- S3 x-amz-checksum-sha1
 	hCRC32 := crc32.NewIEEE()
 	hCRC32C := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	writers := []io.Writer{f, hMD5, hSHA256, hSHA1, hCRC32, hCRC32C}

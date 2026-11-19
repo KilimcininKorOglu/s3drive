@@ -2,7 +2,7 @@ package webui
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- S3 ETag checksum, not a security primitive
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/csv"
@@ -682,7 +682,7 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	combinedPath := combined.Name()
 	defer os.Remove(combinedPath)
-	h := md5.New()
+	h := md5.New() // #nosec G401 -- S3 ETag checksum
 	var total int64
 	for _, part := range parts {
 		f, err := os.Open(part.path)

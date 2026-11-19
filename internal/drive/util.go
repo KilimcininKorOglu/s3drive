@@ -1,7 +1,7 @@
 package drive
 
 import (
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- S3 ETag checksum, not a security primitive
 	"encoding/base64"
 	"encoding/hex"
 	"hash"
@@ -35,7 +35,7 @@ func newSpoolFile(dir string) (*os.File, error) {
 	return os.CreateTemp(dir, "s3drive-*")
 }
 
-func newMD5() hash.Hash { return md5.New() }
+func newMD5() hash.Hash { return md5.New() } // #nosec G401 -- S3 ETag checksum
 
 func hexString(b []byte) string { return hex.EncodeToString(b) }
 

@@ -394,7 +394,7 @@ var tr = &lang{
 	code:     "tr",
 	date:     "2 Oca 2006",
 	dateTime: "2 Oca 2006 15:04",
-	messages: map[string]string{
+	messages: map[string]string{ // #nosec G101 -- UI translations; words such as "şifre" are labels, not credentials
 		"nav.label":      "Ana gezinme",
 		"nav.manage":     "Yönetim",
 		"nav.dashboard":  "Panel",
