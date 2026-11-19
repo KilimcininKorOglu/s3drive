@@ -890,9 +890,12 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) bulkDelete(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
-	_ = r.ParseForm()
 	bucket := r.FormValue("bucket")
 	prefix := normalizePrefix(r.FormValue("prefix"))
+	if err := r.ParseForm(); err != nil {
+		s.filePartial(w, r, bucket, prefix, &flashMessage{Kind: "error", Text: err.Error()})
+		return
+	}
 	keys := r.Form["keys"]
 	if len(keys) == 1 && strings.Contains(keys[0], "\n") {
 		keys = strings.Split(keys[0], "\n")
@@ -901,35 +904,40 @@ func (s *Server) bulkDelete(w http.ResponseWriter, r *http.Request) {
 		s.filePartial(w, r, bucket, prefix, &flashMessage{Kind: "error", Text: l.t("flash.no_selection")})
 		return
 	}
-	deleted, failed := 0, 0
+	deleted := 0
 	var firstErr error
 	for _, key := range keys {
-		if key == "" {
-			continue
-		}
-		var err error
-		if strings.HasSuffix(key, "/") {
-			var n int
-			n, err = s.Svc.DeletePrefix(r.Context(), bucket, key)
-			deleted += n
-		} else {
-			err = s.Svc.Delete(r.Context(), bucket, key)
-			if err == nil || drive.IsNotFound(err) {
-				deleted++
-			}
-		}
-		if err != nil && !drive.IsNotFound(err) {
-			failed++
-			if firstErr == nil {
-				firstErr = err
-			}
+		n, err := s.deleteSelected(r.Context(), bucket, key)
+		deleted += n
+		if firstErr == nil {
+			firstErr = err
 		}
 	}
-	if failed > 0 {
+	if firstErr != nil {
 		s.filePartial(w, r, bucket, prefix, &flashMessage{Kind: "error", Text: l.errorText(firstErr)})
 		return
 	}
 	s.filePartial(w, r, bucket, prefix, &flashMessage{Kind: "ok", Text: l.t("flash.bulk_deleted", deleted)})
+}
+
+// deleteSelected deletes one selected key, or everything under a folder key
+// ending in "/". An already missing object counts as deleted.
+func (s *Server) deleteSelected(ctx context.Context, bucket, key string) (int, error) {
+	if key == "" {
+		return 0, nil
+	}
+	if strings.HasSuffix(key, "/") {
+		n, err := s.Svc.DeletePrefix(ctx, bucket, key)
+		if drive.IsNotFound(err) {
+			err = nil
+		}
+		return n, err
+	}
+	err := s.Svc.Delete(ctx, bucket, key)
+	if err == nil || drive.IsNotFound(err) {
+		return 1, nil
+	}
+	return 0, err
 }
 
 func (s *Server) filePartial(w http.ResponseWriter, r *http.Request, bucket, prefix string, notice *flashMessage) {
@@ -1457,58 +1465,80 @@ func escapeKeyPath(key string) string {
 
 func (s *Server) presign(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
-	accessKey := strings.TrimSpace(r.FormValue("access_key"))
-	bucket := strings.TrimSpace(r.FormValue("bucket"))
-	key := strings.TrimPrefix(strings.TrimSpace(r.FormValue("key")), "/")
-	method := strings.ToUpper(strings.TrimSpace(r.FormValue("method")))
-	if method == "" {
-		method = http.MethodGet
+	p, msgKey := parsePresignForm(r)
+	if msgKey == "" {
+		msgKey = s.presignKeyDenied(r.Context(), &p)
 	}
-	minutes, _ := strconv.Atoi(r.FormValue("expires_minutes"))
-	if minutes <= 0 || minutes > 10080 {
-		minutes = 15
-	}
-	if accessKey == "" || bucket == "" || key == "" {
-		s.setFlash(w, r, "error", l.t("flash.presign_fields"))
-		http.Redirect(w, r, "/keys", http.StatusSeeOther)
+	if msgKey != "" {
+		s.flashRedirect(w, r, l.t(msgKey), "/keys")
 		return
 	}
-	if method != http.MethodGet && method != http.MethodPut && method != http.MethodHead {
-		s.setFlash(w, r, "error", l.t("flash.presign_method"))
-		http.Redirect(w, r, "/keys", http.StatusSeeOther)
+	link, err := s.signPresign(r, p)
+	if err != nil {
+		s.flashRedirect(w, r, l.errorText(err), "/keys")
 		return
 	}
-	keyRow, err := s.Store.GetAccessKey(r.Context(), accessKey)
+	s.setFlashSecret(w, r, "ok", l.t("flash.presigned", p.minutes), link)
+	http.Redirect(w, r, "/keys", http.StatusSeeOther)
+}
+
+// presignForm is a validated presigned-URL request from the keys page.
+type presignForm struct {
+	accessKey, bucket, key, method string
+	minutes                        int
+	keyRow                         *store.AccessKey
+}
+
+// parsePresignForm reads the form; an expiry outside 1..10080 minutes falls
+// back to 15. msgKey names the error for missing fields or a bad method.
+func parsePresignForm(r *http.Request) (presignForm, string) {
+	p := presignForm{
+		accessKey: strings.TrimSpace(r.FormValue("access_key")),
+		bucket:    strings.TrimSpace(r.FormValue("bucket")),
+		key:       strings.TrimPrefix(strings.TrimSpace(r.FormValue("key")), "/"),
+		method:    cmp.Or(strings.ToUpper(strings.TrimSpace(r.FormValue("method"))), http.MethodGet),
+	}
+	p.minutes, _ = strconv.Atoi(r.FormValue("expires_minutes")) // invalid input uses the default below
+	if p.minutes <= 0 || p.minutes > 10080 {
+		p.minutes = 15
+	}
+	if p.accessKey == "" || p.bucket == "" || p.key == "" {
+		return p, "flash.presign_fields"
+	}
+	if p.method != http.MethodGet && p.method != http.MethodPut && p.method != http.MethodHead {
+		return p, "flash.presign_method"
+	}
+	return p, ""
+}
+
+// presignKeyDenied loads the signing key and checks that it is valid and
+// that its policy allows the method on the object.
+func (s *Server) presignKeyDenied(ctx context.Context, p *presignForm) string {
+	keyRow, err := s.Store.GetAccessKey(ctx, p.accessKey)
 	if err != nil || keyRow.Secret == "" || !keyRow.Valid(time.Now()) {
-		s.setFlash(w, r, "error", l.t("flash.presign_key"))
-		http.Redirect(w, r, "/keys", http.StatusSeeOther)
-		return
+		return "flash.presign_key"
 	}
-	allowed := keyRow.CanRead(bucket, key)
-	if method == http.MethodPut {
-		allowed = keyRow.CanWrite(bucket, key)
+	allowed := keyRow.CanRead(p.bucket, p.key)
+	if p.method == http.MethodPut {
+		allowed = keyRow.CanWrite(p.bucket, p.key)
 	}
 	if !allowed {
-		s.setFlash(w, r, "error", l.t("flash.presign_policy"))
-		http.Redirect(w, r, "/keys", http.StatusSeeOther)
-		return
+		return "flash.presign_policy"
 	}
-	if _, err := s.Svc.Bucket(r.Context(), bucket); err != nil {
-		s.setFlash(w, r, "error", l.errorText(err))
-		http.Redirect(w, r, "/keys", http.StatusSeeOther)
-		return
+	p.keyRow = keyRow
+	return ""
+}
+
+func (s *Server) signPresign(r *http.Request, p presignForm) (string, error) {
+	if _, err := s.Svc.Bucket(r.Context(), p.bucket); err != nil {
+		return "", err
 	}
-	secret := keyRow.Secret
-	cfg, _ := s.Svc.LoadSettings(r.Context())
-	raw := strings.TrimRight(s.s3Endpoint(r), "/") + "/" + url.PathEscape(bucket) + "/" + escapeKeyPath(key)
-	link, err := s3.SignQueryMethod(raw, accessKey, secret, cfg.Region, method, time.Now().Add(time.Duration(minutes)*time.Minute))
+	cfg, err := s.Svc.LoadSettings(r.Context())
 	if err != nil {
-		s.setFlash(w, r, "error", l.errorText(err))
-		http.Redirect(w, r, "/keys", http.StatusSeeOther)
-		return
+		return "", err
 	}
-	s.setFlashSecret(w, r, "ok", l.t("flash.presigned", minutes), link)
-	http.Redirect(w, r, "/keys", http.StatusSeeOther)
+	raw := strings.TrimRight(s.s3Endpoint(r), "/") + "/" + url.PathEscape(p.bucket) + "/" + escapeKeyPath(p.key)
+	return s3.SignQueryMethod(raw, p.accessKey, p.keyRow.Secret, cfg.Region, p.method, time.Now().Add(time.Duration(p.minutes)*time.Minute))
 }
 
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
