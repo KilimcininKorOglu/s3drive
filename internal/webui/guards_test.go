@@ -7,9 +7,26 @@ import (
 	"s3drive/internal/store"
 )
 
+type guardCase struct {
+	name    string
+	check   func() (string, error)
+	blocked bool // want a message or an error
+}
+
+func runGuardCases(t *testing.T, cases []guardCase) {
+	t.Helper()
+	for _, c := range cases {
+		msg, err := c.check()
+		if got := msg != "" || err != nil; got != c.blocked {
+			t.Errorf("%s: msg %q err %v, want blocked=%v", c.name, msg, err, c.blocked)
+		}
+	}
+}
+
 // AGENTS.md: the pool name stays reserved and the namespace cannot move
 // while data exists. A store error must block the change, never skip the
-// guard.
+// guard, and the OAuth account lookup must report it instead of adding a
+// duplicate account.
 func TestSettingsGuards(t *testing.T) {
 	ctx := context.Background()
 	s := newTestServer(t)
@@ -21,25 +38,24 @@ func TestSettingsGuards(t *testing.T) {
 	if err := s.Store.CreateBucket(ctx, &store.Bucket{Name: "photos", AccountID: acct.ID, FolderID: "f"}); err != nil {
 		t.Fatal(err)
 	}
-	if msg, err := s.poolNameBlocked(ctx, l, "photos", true, "pool"); msg == "" || err != nil {
-		t.Errorf("enabling pool on an existing bucket name: msg %q err %v", msg, err)
+	poolName := func(name string) func() (string, error) {
+		return func() (string, error) { return s.poolNameBlocked(ctx, l, name, true, "") }
 	}
-	if msg, err := s.poolNameBlocked(ctx, l, "free", true, ""); msg != "" || err != nil {
-		t.Errorf("free pool name blocked: msg %q err %v", msg, err)
-	}
-	if msg, err := s.namespaceChangeBlocked(ctx, l); msg == "" || err != nil {
-		t.Errorf("namespace move with a bucket: msg %q err %v", msg, err)
-	}
+	namespace := func() (string, error) { return s.namespaceChangeBlocked(ctx, l) }
+	lookup := func() (string, error) { _, err := s.accountByEmail(ctx, "user@example.com"); return "", err }
+
+	runGuardCases(t, []guardCase{
+		{"pool on an existing bucket name", poolName("photos"), true},
+		{"free pool name", poolName("free"), false},
+		{"namespace move with a bucket", namespace, true},
+		{"account lookup", lookup, false},
+	})
 	if err := s.Store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if msg, err := s.poolNameBlocked(ctx, l, "free", true, ""); msg == "" && err == nil {
-		t.Error("pool name check passed on an unreadable store")
-	}
-	if msg, err := s.namespaceChangeBlocked(ctx, l); msg == "" && err == nil {
-		t.Error("namespace move allowed on an unreadable store")
-	}
-	if _, err := s.accountByEmail(ctx, "user@example.com"); err == nil {
-		t.Error("account lookup on an unreadable store returned no error, so OAuth would add a duplicate account")
-	}
+	runGuardCases(t, []guardCase{
+		{"pool name on an unreadable store", poolName("free"), true},
+		{"namespace move on an unreadable store", namespace, true},
+		{"account lookup on an unreadable store", lookup, true},
+	})
 }
