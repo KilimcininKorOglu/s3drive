@@ -694,16 +694,26 @@ func (s *Store) RenameBucket(ctx context.Context, oldName, newName string) error
 	return tx.Commit()
 }
 
-// DeleteBucket removes a bucket mapping.
+// DeleteBucket removes a bucket mapping with its metadata, uploads and
+// resumable sessions in one transaction, so a recreated bucket of the same
+// name never inherits stale ETags.
 func (s *Store) DeleteBucket(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM buckets WHERE name=?`, name)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM object_meta WHERE bucket=?`, name)
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM uploads WHERE bucket=?`, name)
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM drive_sessions WHERE bucket=?`, name)
-	return nil
+	defer func() { _ = tx.Rollback() }() // no-op (ErrTxDone) after Commit
+	for _, q := range []string{
+		`DELETE FROM buckets WHERE name=?`,
+		`DELETE FROM object_meta WHERE bucket=?`,
+		`DELETE FROM uploads WHERE bucket=?`,
+		`DELETE FROM drive_sessions WHERE bucket=?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, name); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ---------------------------------------------------------------------------
