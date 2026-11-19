@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"cmp"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -65,76 +66,94 @@ func (a *Authenticator) Authenticate(r *http.Request) (*Auth, *AuthError) {
 }
 
 func (a *Authenticator) verifyHeader(r *http.Request, now time.Time) (*Auth, *AuthError) {
-	authz := r.Header.Get("Authorization")
-	if authz == "" {
-		return nil, authErr("AccessDenied", "anonymous request is not allowed")
+	in, aerr := parseAuthorization(r.Header.Get("Authorization"))
+	if aerr != nil {
+		return nil, aerr
 	}
-	if !strings.HasPrefix(authz, "AWS4-HMAC-SHA256 ") {
-		return nil, authErr("InvalidRequest", "unsupported authorization algorithm")
+	if in.datetime, aerr = headerDateTime(r, now, in.date); aerr != nil {
+		return nil, aerr
+	}
+	in.payloadHash = cmp.Or(r.Header.Get("X-Amz-Content-Sha256"), "UNSIGNED-PAYLOAD")
+	return a.checkSignature(r, now, in)
+}
+
+// sigInput is the signed material shared by header and presigned SigV4.
+type sigInput struct {
+	accessKey, date, region, datetime     string
+	signedHeaders, signature, payloadHash string
+}
+
+// parseAuthorization reads an "AWS4-HMAC-SHA256 Credential=...,
+// SignedHeaders=..., Signature=..." header.
+func parseAuthorization(authz string) (sigInput, *AuthError) {
+	var in sigInput
+	if authz == "" {
+		return in, authErr("AccessDenied", "anonymous request is not allowed")
+	}
+	rest, ok := strings.CutPrefix(authz, "AWS4-HMAC-SHA256 ")
+	if !ok {
+		return in, authErr("InvalidRequest", "unsupported authorization algorithm")
 	}
 	fields := map[string]string{}
-	for part := range strings.SplitSeq(strings.TrimPrefix(authz, "AWS4-HMAC-SHA256 "), ",") {
-		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
-		if ok {
+	for part := range strings.SplitSeq(rest, ",") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(part), "="); ok {
 			fields[k] = v
 		}
 	}
-	credential := fields["Credential"]
-	signedHeaders := fields["SignedHeaders"]
-	signature := fields["Signature"]
+	credential, signedHeaders, signature := fields["Credential"], fields["SignedHeaders"], fields["Signature"]
 	if credential == "" || signedHeaders == "" || signature == "" {
-		return nil, authErr("InvalidRequest", "malformed Authorization header")
+		return in, authErr("InvalidRequest", "malformed Authorization header")
 	}
-	accessKey, _, date, region, ok := parseCredential(credential)
-	if !ok {
-		return nil, authErr("InvalidRequest", "malformed credential scope")
+	in.signedHeaders, in.signature = signedHeaders, signature
+	if in.accessKey, _, in.date, in.region, ok = parseCredential(credential); !ok {
+		return in, authErr("InvalidRequest", "malformed credential scope")
 	}
-	_ = date
+	return in, nil
+}
 
-	datetime := r.Header.Get("X-Amz-Date")
-	if datetime == "" {
-		datetime = r.Header.Get("Date")
-	}
+// headerDateTime returns X-Amz-Date (or Date) after checking the 15-minute
+// skew window and that it matches the credential date.
+func headerDateTime(r *http.Request, now time.Time, date string) (string, *AuthError) {
+	datetime := cmp.Or(r.Header.Get("X-Amz-Date"), r.Header.Get("Date"))
 	t, err := time.Parse("20060102T150405Z", datetime)
 	if err != nil {
-		return nil, authErr("RequestTimeTooSkewed", "missing or invalid x-amz-date")
+		return "", authErr("RequestTimeTooSkewed", "missing or invalid x-amz-date")
 	}
 	if d := now.Sub(t); d > 15*time.Minute || d < -15*time.Minute {
-		return nil, authErr("RequestTimeTooSkewed", "request time is too far from server time")
+		return "", authErr("RequestTimeTooSkewed", "request time is too far from server time")
 	}
 	if date != datetime[:8] {
-		return nil, authErr("InvalidRequest", "credential date does not match x-amz-date")
+		return "", authErr("InvalidRequest", "credential date does not match x-amz-date")
 	}
+	return datetime, nil
+}
 
-	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
-	if payloadHash == "" {
-		payloadHash = "UNSIGNED-PAYLOAD"
-	}
-
-	keyRow, err := a.Store.GetAccessKey(r.Context(), accessKey)
+// checkSignature loads an active, unexpired access key and compares the
+// SigV4 signature in constant time.
+func (a *Authenticator) checkSignature(r *http.Request, now time.Time, in sigInput) (*Auth, *AuthError) {
+	keyRow, err := a.Store.GetAccessKey(r.Context(), in.accessKey)
 	if err != nil || !keyRow.Active {
 		return nil, authErr("InvalidAccessKeyId", "the access key does not exist or is disabled")
 	}
 	if !keyRow.ExpiresAt.IsZero() && !now.Before(keyRow.ExpiresAt) {
 		return nil, authErr("AccessDenied", "this access key has expired")
 	}
-	secret := keyRow.Secret
-
-	canonical, aerr := canonicalRequest(r, signedHeaders, payloadHash)
+	canonical, aerr := canonicalRequest(r, in.signedHeaders, in.payloadHash)
 	if aerr != nil {
 		return nil, aerr
 	}
-	scopeLine := date + "/" + region + "/s3/aws4_request"
-	stringToSign := "AWS4-HMAC-SHA256\n" + datetime + "\n" + scopeLine + "\n" + sha256Hex(canonical)
-	key := signingKey(secret, date, region, "s3")
+	scopeLine := in.date + "/" + in.region + "/s3/aws4_request"
+	stringToSign := "AWS4-HMAC-SHA256\n" + in.datetime + "\n" + scopeLine + "\n" + sha256Hex(canonical)
+	key := signingKey(keyRow.Secret, in.date, in.region, "s3")
 	expected := hex.EncodeToString(hmacSHA256(key, stringToSign))
-	if subtle.ConstantTimeCompare([]byte(expected), []byte(strings.ToLower(signature))) != 1 {
+	signature := strings.ToLower(in.signature)
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) != 1 {
 		return nil, authErr("SignatureDoesNotMatch", "the request signature we calculated does not match the signature you provided")
 	}
-	a.Store.TouchAccessKey(r.Context(), accessKey)
+	a.Store.TouchAccessKey(r.Context(), in.accessKey)
 	return &Auth{
-		AccessKey: accessKey, Key: keyRow, PayloadHash: payloadHash, Signature: strings.ToLower(signature),
-		SigningKey: key, Scope: scopeLine, DateTime: datetime,
+		AccessKey: in.accessKey, Key: keyRow, PayloadHash: in.payloadHash, Signature: signature,
+		SigningKey: key, Scope: scopeLine, DateTime: in.datetime,
 	}, nil
 }
 
@@ -150,55 +169,44 @@ func (a *Authenticator) verifyPresigned(r *http.Request, now time.Time) (*Auth, 
 	if credential == "" || signedHeaders == "" || signature == "" || datetime == "" {
 		return nil, authErr("InvalidRequest", "incomplete presigned request")
 	}
-	accessKey, _, date, region, ok := parseCredential(credential)
-	if !ok {
+	in := sigInput{signedHeaders: signedHeaders, signature: signature, datetime: datetime}
+	var ok bool
+	if in.accessKey, _, in.date, in.region, ok = parseCredential(credential); !ok {
 		return nil, authErr("InvalidRequest", "malformed credential scope")
 	}
-	t, err := time.Parse("20060102T150405Z", datetime)
-	if err != nil {
-		return nil, authErr("RequestTimeTooSkewed", "invalid X-Amz-Date")
+	if aerr := checkPresignWindow(q, in.date, datetime, now); aerr != nil {
+		return nil, aerr
 	}
-	if date != datetime[:8] {
-		return nil, authErr("InvalidRequest", "credential date does not match X-Amz-Date")
-	}
-	expires, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
-	if err != nil || expires < 1 || expires > 604800 {
-		return nil, authErr("InvalidRequest", "X-Amz-Expires must be between 1 and 604800 seconds")
-	}
-	if now.After(t.Add(time.Duration(expires) * time.Second)) {
-		return nil, authErr("AccessDenied", "request has expired")
-	}
-	if t.After(now.Add(15 * time.Minute)) {
-		return nil, authErr("RequestTimeTooSkewed", "presigned request is from the future")
-	}
-	payloadHash := q.Get("X-Amz-Content-Sha256")
-	if payloadHash == "" {
-		payloadHash = "UNSIGNED-PAYLOAD"
-	}
-	keyRow, err := a.Store.GetAccessKey(r.Context(), accessKey)
-	if err != nil || !keyRow.Active {
-		return nil, authErr("InvalidAccessKeyId", "the access key does not exist or is disabled")
-	}
-	if !keyRow.ExpiresAt.IsZero() && !now.Before(keyRow.ExpiresAt) {
-		return nil, authErr("AccessDenied", "this access key has expired")
-	}
-	secret := keyRow.Secret
-	canonical, aerr := canonicalRequest(r, signedHeaders, payloadHash)
+	in.payloadHash = cmp.Or(q.Get("X-Amz-Content-Sha256"), "UNSIGNED-PAYLOAD")
+	auth, aerr := a.checkSignature(r, now, in)
 	if aerr != nil {
 		return nil, aerr
 	}
-	scopeLine := date + "/" + region + "/s3/aws4_request"
-	stringToSign := "AWS4-HMAC-SHA256\n" + datetime + "\n" + scopeLine + "\n" + sha256Hex(canonical)
-	key := signingKey(secret, date, region, "s3")
-	expected := hex.EncodeToString(hmacSHA256(key, stringToSign))
-	if subtle.ConstantTimeCompare([]byte(expected), []byte(strings.ToLower(signature))) != 1 {
-		return nil, authErr("SignatureDoesNotMatch", "the request signature we calculated does not match the signature you provided")
+	auth.Presigned = true
+	return auth, nil
+}
+
+// checkPresignWindow validates X-Amz-Date against the credential date and
+// the X-Amz-Expires window (1 s to 7 days, at most 15 min in the future).
+func checkPresignWindow(q url.Values, date, datetime string, now time.Time) *AuthError {
+	t, err := time.Parse("20060102T150405Z", datetime)
+	if err != nil {
+		return authErr("RequestTimeTooSkewed", "invalid X-Amz-Date")
 	}
-	a.Store.TouchAccessKey(r.Context(), accessKey)
-	return &Auth{
-		AccessKey: accessKey, Key: keyRow, PayloadHash: payloadHash, Signature: strings.ToLower(signature),
-		SigningKey: key, Scope: scopeLine, DateTime: datetime, Presigned: true,
-	}, nil
+	if date != datetime[:8] {
+		return authErr("InvalidRequest", "credential date does not match X-Amz-Date")
+	}
+	expires, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
+	if err != nil || expires < 1 || expires > 604800 {
+		return authErr("InvalidRequest", "X-Amz-Expires must be between 1 and 604800 seconds")
+	}
+	if now.After(t.Add(time.Duration(expires) * time.Second)) {
+		return authErr("AccessDenied", "request has expired")
+	}
+	if t.After(now.Add(15 * time.Minute)) {
+		return authErr("RequestTimeTooSkewed", "presigned request is from the future")
+	}
+	return nil
 }
 
 func parseCredential(cred string) (accessKey, scope, date, region string, ok bool) {
