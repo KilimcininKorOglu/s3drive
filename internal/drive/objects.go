@@ -335,14 +335,7 @@ func (s *Service) locate(ctx context.Context, bucketName, key string) (*store.Ac
 	}
 
 	if !ref.Pool {
-		parent, err := s.findFolder(ctx, ref.Account, ref.FolderID, dirs)
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, nil, newError("NoSuchKey", "object %q does not exist", key)
-		}
-		if err != nil {
-			return nil, nil, err
-		}
-		f, err := s.Google.FindChild(ctx, ref.Account, parent, encodeSegment(name), false)
+		f, err := s.findInFolder(ctx, ref.Account, ref.FolderID, dirs, name)
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, nil, newError("NoSuchKey", "object %q does not exist", key)
 		}
@@ -351,17 +344,40 @@ func (s *Service) locate(ctx context.Context, bucketName, key string) (*store.Ac
 		}
 		return ref.Account, f, nil
 	}
-
-	// Pool: consult the index first.
-	if p, err := s.Store.GetPoolObject(ctx, key); err == nil {
-		if acct, err := s.Store.GetAccount(ctx, p.AccountID); err == nil {
-			if f, err := s.Google.GetFile(ctx, acct, p.FileID); err == nil {
-				return acct, f, nil
-			}
-		}
-		s.logStoreErr("drop stale pool index entry", key, s.Store.DeletePoolObject(ctx, key))
+	// Pool: consult the index first, then scan the accounts.
+	if acct, f := s.locateIndexed(ctx, key); f != nil {
+		return acct, f, nil
 	}
+	return s.scanPool(ctx, key, dirs, name)
+}
 
+func (s *Service) findInFolder(ctx context.Context, acct *store.Account, folderID string, dirs []string, name string) (*google.File, error) {
+	parent, err := s.findFolder(ctx, acct, folderID, dirs)
+	if err != nil {
+		return nil, err
+	}
+	return s.Google.FindChild(ctx, acct, parent, encodeSegment(name), false)
+}
+
+// locateIndexed resolves a pool key through the index. An entry that no
+// longer resolves is dropped; the account scan then repairs it.
+func (s *Service) locateIndexed(ctx context.Context, key string) (*store.Account, *google.File) {
+	p, err := s.Store.GetPoolObject(ctx, key)
+	if err != nil {
+		return nil, nil
+	}
+	if acct, err := s.Store.GetAccount(ctx, p.AccountID); err == nil {
+		if f, err := s.Google.GetFile(ctx, acct, p.FileID); err == nil {
+			return acct, f
+		}
+	}
+	s.logStoreErr("drop stale pool index entry", key, s.Store.DeletePoolObject(ctx, key))
+	return nil, nil
+}
+
+// scanPool looks for a pool key in every account and repairs the index on
+// a hit.
+func (s *Service) scanPool(ctx context.Context, key string, dirs []string, name string) (*store.Account, *google.File, error) {
 	accounts, err := s.Store.ListAccounts(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -371,11 +387,7 @@ func (s *Service) locate(ctx context.Context, bucketName, key string) (*store.Ac
 		if err != nil {
 			continue
 		}
-		parent, err := s.findFolder(ctx, acct, folderID, dirs)
-		if err != nil {
-			continue
-		}
-		f, err := s.Google.FindChild(ctx, acct, parent, encodeSegment(name), false)
+		f, err := s.findInFolder(ctx, acct, folderID, dirs, name)
 		if err != nil {
 			continue
 		}
@@ -563,17 +575,20 @@ func (s *Service) DeleteEmptyFolder(ctx context.Context, bucketName, prefix stri
 	if !ref.Pool {
 		return s.deleteFolderIn(ctx, ref.Account, ref.FolderID, dirs, name)
 	}
+	return s.deletePoolFolder(ctx, dirs, name)
+}
+
+// deletePoolFolder removes the empty folder from every account's pool
+// folder. Accounts without a pool folder are skipped; the first delete
+// error is returned after all accounts were tried.
+func (s *Service) deletePoolFolder(ctx context.Context, dirs []string, name string) error {
 	accounts, err := s.Store.ListAccounts(ctx)
 	if err != nil {
 		return err
 	}
 	var firstErr error
 	for _, acct := range accounts {
-		ns, err := s.ensureNamespace(ctx, acct)
-		if err != nil {
-			continue
-		}
-		poolFolder, err := s.findFolder(ctx, acct, ns, []string{s.poolName(ctx)})
+		poolFolder, err := s.poolPrefixFolder(ctx, acct, nil)
 		if err != nil {
 			continue
 		}
