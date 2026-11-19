@@ -68,7 +68,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	warnConfig(&cfg,uiLn.Addr().String(), logger)
+	warnConfig(&cfg, uiLn.Addr().String(), logger)
 	logger.Info("s3drive starting", "version", config.Version,
 		"s3", s3ln.Addr().String(), "ui", uiLn.Addr().String(), "data", cfg.DataDir)
 
