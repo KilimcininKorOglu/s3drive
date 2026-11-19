@@ -657,31 +657,37 @@ func parseByteRange(value string, size int64) (start, end int64, length int64, o
 		return 0, 0, 0, false
 	}
 	if a == "" {
-		n, err := strconv.ParseInt(strings.TrimSpace(b), 10, 64)
-		if err != nil || n <= 0 {
-			return 0, 0, 0, false
-		}
-		if n > size {
-			n = size
-		}
-		if n == 0 {
-			return 0, 0, 0, false
-		}
-		return size - n, size - 1, n, true
+		return suffixRange(strings.TrimSpace(b), size)
 	}
-	start, err := strconv.ParseInt(a, 10, 64)
+	return boundedRange(a, strings.TrimSpace(b), size)
+}
+
+// suffixRange resolves "-N": the last N bytes, clamped to the object size.
+func suffixRange(n string, size int64) (start, end, length int64, ok bool) {
+	count, err := strconv.ParseInt(n, 10, 64)
+	if err != nil || count <= 0 {
+		return 0, 0, 0, false
+	}
+	count = min(count, size)
+	if count == 0 {
+		return 0, 0, 0, false
+	}
+	return size - count, size - 1, count, true
+}
+
+// boundedRange resolves "first-" and "first-last", clamping last to the end.
+func boundedRange(first, last string, size int64) (start, end, length int64, ok bool) {
+	start, err := strconv.ParseInt(first, 10, 64)
 	if err != nil || start < 0 || start >= size {
 		return 0, 0, 0, false
 	}
 	end = size - 1
-	if strings.TrimSpace(b) != "" {
-		end, err = strconv.ParseInt(strings.TrimSpace(b), 10, 64)
+	if last != "" {
+		end, err = strconv.ParseInt(last, 10, 64)
 		if err != nil || end < start {
 			return 0, 0, 0, false
 		}
-		if end >= size {
-			end = size - 1
-		}
+		end = min(end, size-1)
 	}
 	return start, end, end - start + 1, true
 }
@@ -980,6 +986,23 @@ func (s *Server) fail(o *opCtx, err error) {
 	writeS3Error(o.w, o.r, o.reqID, code, message, status)
 }
 
+func mapGoogleError(ae *google.APIError) (code, message string, status int) {
+	switch ae.Status {
+	case http.StatusUnauthorized:
+		return "AccessDenied", "the connected Google account must be reauthorized", http.StatusForbidden
+	case http.StatusNotFound:
+		return "NoSuchKey", "the specified key does not exist", http.StatusNotFound
+	case http.StatusForbidden:
+		return "AccessDenied", ae.Message, http.StatusForbidden
+	case http.StatusRequestedRangeNotSatisfiable:
+		return "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable
+	case http.StatusTooManyRequests:
+		return "SlowDown", "Google Drive is rate limiting requests, please retry", http.StatusServiceUnavailable
+	default:
+		return "InternalError", "Google Drive request failed", http.StatusInternalServerError
+	}
+}
+
 func mapError(err error) (code, message string, status int) {
 	if errors.Is(err, errPayloadHashMismatch) {
 		return "XAmzContentSHA256Mismatch", errPayloadHashMismatch.Error(), http.StatusBadRequest
@@ -988,20 +1011,7 @@ func mapError(err error) (code, message string, status int) {
 		return de.Code, de.Message, de.Status
 	}
 	if ae, ok := errors.AsType[*google.APIError](err); ok {
-		switch ae.Status {
-		case http.StatusUnauthorized:
-			return "AccessDenied", "the connected Google account must be reauthorized", http.StatusForbidden
-		case http.StatusNotFound:
-			return "NoSuchKey", "the specified key does not exist", http.StatusNotFound
-		case http.StatusForbidden:
-			return "AccessDenied", ae.Message, http.StatusForbidden
-		case http.StatusRequestedRangeNotSatisfiable:
-			return "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable
-		case http.StatusTooManyRequests:
-			return "SlowDown", "Google Drive is rate limiting requests, please retry", http.StatusServiceUnavailable
-		default:
-			return "InternalError", "Google Drive request failed", http.StatusInternalServerError
-		}
+		return mapGoogleError(ae)
 	}
 	if errors.Is(err, google.ErrReauth) {
 		return "AccessDenied", "the connected Google account must be reauthorized", http.StatusForbidden
@@ -1075,66 +1085,78 @@ func acctIDOf(a *store.Account) string {
 }
 
 func opName(r *http.Request, bucket, key string) string {
-	if bucket == "" {
+	switch {
+	case bucket == "":
 		return "ListBuckets"
+	case key == "":
+		return bucketOpName(r)
 	}
-	if key == "" {
-		switch r.Method {
-		case http.MethodPut:
-			return "CreateBucket"
-		case http.MethodDelete:
-			return "DeleteBucket"
-		case http.MethodHead:
-			return "HeadBucket"
-		case http.MethodPost:
-			if hasQuery(r, "delete") {
-				return "DeleteObjects"
-			}
-			return "Post"
-		case http.MethodGet:
-			switch {
-			case hasQuery(r, "location"):
-				return "GetBucketLocation"
-			case hasQuery(r, "uploads"):
-				return "ListMultipartUploads"
-			default:
-				return "ListObjects"
-			}
-		}
-		return ""
-	}
-	q := r.URL.Query()
+	return objectOpName(r)
+}
+
+func bucketOpName(r *http.Request) string {
 	switch r.Method {
 	case http.MethodPut:
-		if r.Header.Get("x-amz-copy-source") != "" {
-			return "CopyObject"
-		}
-		if q.Get("uploadId") != "" {
-			return "UploadPart"
-		}
-		return "PutObject"
+		return "CreateBucket"
+	case http.MethodDelete:
+		return "DeleteBucket"
+	case http.MethodHead:
+		return "HeadBucket"
 	case http.MethodPost:
-		if hasQuery(r, "uploads") {
-			return "CreateMultipartUpload"
+		if hasQuery(r, "delete") {
+			return "DeleteObjects"
 		}
-		if q.Get("uploadId") != "" {
-			return "CompleteMultipartUpload"
-		}
-		return "PostObject"
+		return "Post"
 	case http.MethodGet:
-		if q.Get("uploadId") != "" {
-			return "ListParts"
+		switch {
+		case hasQuery(r, "location"):
+			return "GetBucketLocation"
+		case hasQuery(r, "uploads"):
+			return "ListMultipartUploads"
 		}
-		return "GetObject"
+		return "ListObjects"
+	}
+	return ""
+}
+
+// objectOpName names an object request; a request carrying uploadId belongs
+// to the multipart variant of the method's operation.
+func objectOpName(r *http.Request) string {
+	multipart := r.URL.Query().Get("uploadId") != ""
+	switch r.Method {
+	case http.MethodPut:
+		return putOpName(r, multipart)
+	case http.MethodPost:
+		return postOpName(r, multipart)
+	case http.MethodGet:
+		return pick(multipart, "ListParts", "GetObject")
 	case http.MethodHead:
 		return "HeadObject"
 	case http.MethodDelete:
-		if q.Get("uploadId") != "" {
-			return "AbortMultipartUpload"
-		}
-		return "DeleteObject"
+		return pick(multipart, "AbortMultipartUpload", "DeleteObject")
 	}
 	return ""
+}
+
+func putOpName(r *http.Request, multipart bool) string {
+	if r.Header.Get("x-amz-copy-source") != "" {
+		return "CopyObject"
+	}
+	return pick(multipart, "UploadPart", "PutObject")
+}
+
+func postOpName(r *http.Request, multipart bool) string {
+	if hasQuery(r, "uploads") {
+		return "CreateMultipartUpload"
+	}
+	return pick(multipart, "CompleteMultipartUpload", "PostObject")
+}
+
+func pick(cond bool, yes, no string) string {
+	if cond {
+		return yes
+	}
+	return no
 }
 
 func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request, cfg drive.Settings) {
