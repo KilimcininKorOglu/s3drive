@@ -91,27 +91,28 @@ func TestPastAfterSkipsWholeCommonPrefix(t *testing.T) {
 }
 
 func TestSplitKeyAndPrefix(t *testing.T) {
-	dirs, name, err := splitKey("a/b/c.txt")
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		fn       string
+		in       string
+		dirs     string
+		name     string
+		rejected bool
+	}{
+		{"splitKey", "a/b/c.txt", "a/b", "c.txt", false},
+		{"splitKey", "single", "", "single", false},
+		{"splitKey", "", "", "", true},
+		{"splitPrefix", "a/b/", "a/b", "", false},
+		{"splitPrefix", "a/b/c", "a/b", "c", false},
 	}
-	if strings.Join(dirs, "/") != "a/b" || name != "c.txt" {
-		t.Fatalf("splitKey = %v %q", dirs, name)
-	}
-	dirs, name, err = splitKey("single")
-	if err != nil || len(dirs) != 0 || name != "single" {
-		t.Fatalf("single splitKey = %v %q %v", dirs, name, err)
-	}
-	if _, _, err := splitKey(""); err == nil {
-		t.Fatal("empty splitKey accepted")
-	}
-
-	dirs, name, err = splitPrefix("a/b/")
-	if err != nil || strings.Join(dirs, "/") != "a/b" || name != "" {
-		t.Fatalf("directory prefix = %v %q %v", dirs, name, err)
-	}
-	dirs, name, err = splitPrefix("a/b/c")
-	if err != nil || strings.Join(dirs, "/") != "a/b" || name != "c" {
-		t.Fatalf("name prefix = %v %q %v", dirs, name, err)
+	split := map[string]func(string) ([]string, string, error){"splitKey": splitKey, "splitPrefix": splitPrefix}
+	for _, c := range cases {
+		dirs, name, err := split[c.fn](c.in)
+		if c.rejected != (err != nil) {
+			t.Errorf("%s(%q) err = %v, want rejected=%v", c.fn, c.in, err, c.rejected)
+			continue
+		}
+		if !c.rejected && (strings.Join(dirs, "/") != c.dirs || name != c.name) {
+			t.Errorf("%s(%q) = %v %q, want %q %q", c.fn, c.in, dirs, name, c.dirs, c.name)
+		}
 	}
 }

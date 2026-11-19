@@ -143,44 +143,29 @@ type Settings struct {
 // LoadSettings reads settings, applying defaults.
 func (s *Service) LoadSettings(ctx context.Context) (Settings, error) {
 	out := Settings{Region: "us-east-1", PoolName: "pool", PoolEnabled: true, PublicURL: s.PublicURL, SiteName: "s3drive", Namespace: defaultNamespace}
-	get := func(key string) (string, error) { return s.Store.Setting(ctx, key) }
-	var err error
-	if v, e := get(SettingRegion); e != nil {
-		return out, e
-	} else if v != "" {
-		out.Region = v
+	// An empty stored value keeps the default.
+	fields := []struct {
+		key string
+		set func(string)
+	}{
+		{SettingRegion, func(v string) { out.Region = v }},
+		{SettingPoolName, func(v string) { out.PoolName = v }},
+		{SettingPoolEnabled, func(v string) { out.PoolEnabled = v != "0" }},
+		{SettingPublicURL, func(v string) { out.PublicURL = strings.TrimRight(v, "/") }},
+		{SettingCORS, func(v string) { out.CORSOrigins = v }},
+		{SettingSiteName, func(v string) { out.SiteName = v }},
+		{SettingNamespace, func(v string) { out.Namespace = v }},
 	}
-	if v, e := get(SettingPoolName); e != nil {
-		return out, e
-	} else if v != "" {
-		out.PoolName = v
+	for _, f := range fields {
+		v, err := s.Store.Setting(ctx, f.key)
+		if err != nil {
+			return out, err
+		}
+		if v != "" {
+			f.set(v)
+		}
 	}
-	if v, e := get(SettingPoolEnabled); e != nil {
-		return out, e
-	} else if v == "0" {
-		out.PoolEnabled = false
-	}
-	if v, e := get(SettingPublicURL); e != nil {
-		return out, e
-	} else if v != "" {
-		out.PublicURL = strings.TrimRight(v, "/")
-	}
-	if v, e := get(SettingCORS); e != nil {
-		return out, e
-	} else if v != "" {
-		out.CORSOrigins = v
-	}
-	if v, e := get(SettingSiteName); e != nil {
-		return out, e
-	} else if v != "" {
-		out.SiteName = v
-	}
-	if v, e := get(SettingNamespace); e != nil {
-		return out, e
-	} else if v != "" {
-		out.Namespace = v
-	}
-	return out, err
+	return out, nil
 }
 
 // Namespace returns the private Drive root folder name used for all buckets.
