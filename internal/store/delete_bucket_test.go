@@ -11,20 +11,13 @@ import (
 func TestDeleteBucketIsAtomic(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
-	if err := st.CreateAccount(ctx, &Account{ID: "acct", Name: "Test", Email: "test@example.com"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.CreateBucket(ctx, &Bucket{Name: "b", AccountID: "acct", FolderID: "folder"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.PutDriveSession(ctx, DriveSession{Bucket: "b", Key: "k", AccountID: "acct", SessionURL: "https://upload.example/s", Size: 10}); err != nil {
-		t.Fatal(err)
-	}
+	must(t, st.CreateAccount(ctx, &Account{ID: "acct", Name: "Test", Email: "test@example.com"}))
+	must(t, st.CreateBucket(ctx, &Bucket{Name: "b", AccountID: "acct", FolderID: "folder"}))
+	must(t, st.PutDriveSession(ctx, DriveSession{Bucket: "b", Key: "k", AccountID: "acct", SessionURL: "https://upload.example/s", Size: 10}))
 	// Simulate a failure on the last cleanup statement.
-	if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_session_delete BEFORE DELETE ON drive_sessions
-		BEGIN SELECT RAISE(ABORT, 'injected failure'); END`); err != nil {
-		t.Fatal(err)
-	}
+	_, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_session_delete BEFORE DELETE ON drive_sessions
+		BEGIN SELECT RAISE(ABORT, 'injected failure'); END`)
+	must(t, err)
 
 	if err := st.DeleteBucket(ctx, "b"); err == nil {
 		t.Fatal("DeleteBucket returned nil although cleanup failed")
@@ -36,16 +29,11 @@ func TestDeleteBucketIsAtomic(t *testing.T) {
 		t.Fatalf("drive session lost: %v", err)
 	}
 
-	if _, err := st.db.ExecContext(ctx, `DROP TRIGGER fail_session_delete`); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.DeleteBucket(ctx, "b"); err != nil {
-		t.Fatalf("DeleteBucket: %v", err)
-	}
-	if _, err := st.GetBucket(ctx, "b"); err == nil {
-		t.Fatal("bucket mapping still present after DeleteBucket")
-	}
-	if _, err := st.GetDriveSession(ctx, "b", "k"); err == nil {
-		t.Fatal("drive session still present after DeleteBucket")
-	}
+	_, err = st.db.ExecContext(ctx, `DROP TRIGGER fail_session_delete`)
+	must(t, err)
+	must(t, st.DeleteBucket(ctx, "b"))
+	_, err = st.GetBucket(ctx, "b")
+	wantNotFound(t, err, "bucket mapping")
+	_, err = st.GetDriveSession(ctx, "b", "k")
+	wantNotFound(t, err, "drive session")
 }

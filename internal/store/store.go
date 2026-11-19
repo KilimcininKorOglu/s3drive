@@ -911,43 +911,42 @@ func (s *Store) RecentEvents(ctx context.Context, limit int) ([]Event, error) {
 }
 
 // ListEvents returns audit rows matching f and the total count of matches.
+// whereBuilder collects parameterized SQL conditions in order.
+type whereBuilder struct {
+	conds []string
+	args  []any
+}
+
+func (b *whereBuilder) addIf(ok bool, cond string, args ...any) {
+	if ok {
+		b.conds = append(b.conds, cond)
+		b.args = append(b.args, args...)
+	}
+}
+
+func (b *whereBuilder) clause() string {
+	if len(b.conds) == 0 {
+		return ""
+	}
+	return ` WHERE ` + strings.Join(b.conds, ` AND `)
+}
+
+// eventWhere builds the audit-log filter; every value is a bound parameter.
+func eventWhere(f EventFilter) (string, []any) {
+	var b whereBuilder
+	b.addIf(f.Op != "", `op = ?`, f.Op)
+	b.addIf(f.Bucket != "", `bucket = ?`, f.Bucket)
+	b.addIf(f.Key != "", `key LIKE ? ESCAPE '\'`, likePrefix(f.Key))
+	b.addIf(f.AccessKey != "", `access_key = ?`, f.AccessKey)
+	b.addIf(f.Status == "ok", `status < 400`)
+	b.addIf(f.Status == "error", `status >= 400`)
+	b.addIf(!f.Since.IsZero(), `ts >= ?`, f.Since.Unix())
+	b.addIf(!f.Until.IsZero(), `ts < ?`, f.Until.Unix())
+	return b.clause(), b.args
+}
+
 func (s *Store) ListEvents(ctx context.Context, f EventFilter) ([]Event, int, error) {
-	var where []string
-	var args []any
-	if f.Op != "" {
-		where = append(where, `op = ?`)
-		args = append(args, f.Op)
-	}
-	if f.Bucket != "" {
-		where = append(where, `bucket = ?`)
-		args = append(args, f.Bucket)
-	}
-	if f.Key != "" {
-		where = append(where, `key LIKE ? ESCAPE '\'`)
-		args = append(args, likePrefix(f.Key))
-	}
-	if f.AccessKey != "" {
-		where = append(where, `access_key = ?`)
-		args = append(args, f.AccessKey)
-	}
-	switch f.Status {
-	case "ok":
-		where = append(where, `status < 400`)
-	case "error":
-		where = append(where, `status >= 400`)
-	}
-	if !f.Since.IsZero() {
-		where = append(where, `ts >= ?`)
-		args = append(args, f.Since.Unix())
-	}
-	if !f.Until.IsZero() {
-		where = append(where, `ts < ?`)
-		args = append(args, f.Until.Unix())
-	}
-	clause := ""
-	if len(where) > 0 {
-		clause = ` WHERE ` + strings.Join(where, ` AND `)
-	}
+	clause, args := eventWhere(f)
 	var total int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`+clause, args...).Scan(&total); err != nil {
 		return nil, 0, err
