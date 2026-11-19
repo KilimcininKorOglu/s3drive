@@ -272,8 +272,11 @@ func normalizePrefix(prefix string) string {
 func (s *Server) buildFiles(r *http.Request, b baseData, bucket, prefix, afterToken string, notice *flashMessage) filesData {
 	ctx := r.Context()
 	l := s.t(r)
-	buckets, _ := s.Svc.ListBuckets(ctx)
+	buckets, err := s.Svc.ListBuckets(ctx)
 	data := filesData{baseData: b, Buckets: buckets, Bucket: bucket, Prefix: prefix, Notice: notice}
+	if err != nil {
+		data.addErrorNotice(err)
+	}
 	if bucket == "" && len(buckets) > 0 {
 		bucket = buckets[0].Name
 		data.Bucket = bucket
@@ -287,63 +290,76 @@ func (s *Server) buildFiles(r *http.Request, b baseData, bucket, prefix, afterTo
 			break
 		}
 	}
-
-	after := ""
-	if afterToken != "" {
-		if raw, err := base64.RawURLEncoding.DecodeString(afterToken); err == nil {
-			after = string(raw)
-		}
-	}
-	res, err := s.Svc.ListUI(ctx, bucket, prefix, "/", 1000, after)
+	res, err := s.Svc.ListUI(ctx, bucket, prefix, "/", 1000, decodeAfterToken(afterToken))
 	if err != nil {
-		if data.Notice == nil {
-			data.Notice = &flashMessage{Kind: "error", Text: err.Error()}
-		}
+		data.addErrorNotice(err)
 	} else {
-		for _, p := range res.CommonPrefixes {
-			name := strings.TrimPrefix(p, prefix)
-			name = strings.TrimSuffix(name, "/")
-			if name == "" {
-				continue
-			}
-			data.Folders = append(data.Folders, folderView{Name: name, Prefix: p})
-		}
-		for _, o := range res.Objects {
-			name := strings.TrimPrefix(o.Key, prefix)
-			if name == "" || strings.Contains(name, "/") {
-				name = filepath.Base(o.Key)
-			}
-			preview := previewKind(o.Key, o.ContentType)
-			native := drive.IsNativeDoc(o.ContentType)
-			if native {
-				preview = "pdf"
-			}
-			data.Files = append(data.Files, fileView{
-				Key: o.Key, Name: name, When: s.shortWhen(l, o.Modified),
-				Size: o.Size, AccountMail: o.AccountMail, Preview: preview, Native: native,
-			})
-		}
-		if res.IsTruncated && res.NextAfter != "" {
-			data.NextToken = base64.RawURLEncoding.EncodeToString([]byte(res.NextAfter))
-		}
+		s.fillListing(&data, l, res, prefix)
 	}
 	data.ItemCount = len(data.Folders) + len(data.Files)
+	data.Crumbs = breadcrumbs(bucket, prefix)
+	return data
+}
 
-	// Breadcrumbs: bucket root, then one crumb per prefix segment.
-	data.Crumbs = append(data.Crumbs, crumbView{Name: bucket, Prefix: ""})
+// addErrorNotice shows err unless a flash message is already displayed.
+func (d *filesData) addErrorNotice(err error) {
+	if d.Notice == nil {
+		d.Notice = &flashMessage{Kind: "error", Text: err.Error()}
+	}
+}
+
+// decodeAfterToken reverses the base64 page token; an invalid token starts
+// from the first page.
+func decodeAfterToken(token string) string {
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func (s *Server) fillListing(data *filesData, l *lang, res *drive.ListResult, prefix string) {
+	for _, p := range res.CommonPrefixes {
+		name := strings.TrimSuffix(strings.TrimPrefix(p, prefix), "/")
+		if name != "" {
+			data.Folders = append(data.Folders, folderView{Name: name, Prefix: p})
+		}
+	}
+	for _, o := range res.Objects {
+		name := strings.TrimPrefix(o.Key, prefix)
+		if name == "" || strings.Contains(name, "/") {
+			name = filepath.Base(o.Key)
+		}
+		preview := previewKind(o.Key, o.ContentType)
+		native := drive.IsNativeDoc(o.ContentType)
+		if native {
+			preview = "pdf"
+		}
+		data.Files = append(data.Files, fileView{
+			Key: o.Key, Name: name, When: s.shortWhen(l, o.Modified),
+			Size: o.Size, AccountMail: o.AccountMail, Preview: preview, Native: native,
+		})
+	}
+	if res.IsTruncated && res.NextAfter != "" {
+		data.NextToken = base64.RawURLEncoding.EncodeToString([]byte(res.NextAfter))
+	}
+}
+
+// breadcrumbs returns the bucket root crumb, then one crumb per prefix
+// segment; the final crumb is marked Last.
+func breadcrumbs(bucket, prefix string) []crumbView {
+	crumbs := []crumbView{{Name: bucket, Prefix: ""}}
 	if prefix != "" {
 		parts := strings.Split(strings.TrimSuffix(prefix, "/"), "/")
 		var cumulative strings.Builder
-		for i, part := range parts {
+		for _, part := range parts {
 			cumulative.WriteString(part)
 			cumulative.WriteByte('/')
-			data.Crumbs = append(data.Crumbs, crumbView{Name: part, Prefix: cumulative.String(), Last: i == len(parts)-1})
+			crumbs = append(crumbs, crumbView{Name: part, Prefix: cumulative.String()})
 		}
 	}
-	if len(data.Crumbs) == 1 {
-		data.Crumbs[0].Last = true
-	}
-	return data
+	crumbs[len(crumbs)-1].Last = true
+	return crumbs
 }
 
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
