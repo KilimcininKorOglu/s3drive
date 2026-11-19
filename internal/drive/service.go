@@ -327,6 +327,41 @@ func (s *Service) SetPublicRead(ctx context.Context, name string, public bool) e
 }
 
 // RenameBucket renames a pinned bucket's Drive folder and local references.
+// renameTargetFree checks that newName is not the reserved pool name, not a
+// known bucket and not another folder in the account's Drive namespace. A
+// lookup error blocks the rename instead of skipping the check.
+func (s *Service) renameTargetFree(ctx context.Context, ref *BucketRef, newName string) error {
+	cfg, err := s.LoadSettings(ctx)
+	if err != nil {
+		return err
+	}
+	if newName == cfg.PoolName {
+		return newError("BucketAlreadyExists", "bucket name %q is reserved for the pool", newName)
+	}
+	_, err = s.Store.GetBucket(ctx, newName)
+	if err == nil {
+		return newError("BucketAlreadyExists", "bucket %q already exists", newName)
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	ns, err := s.ensureNamespace(ctx, ref.Account)
+	if err != nil {
+		return err
+	}
+	existing, err := s.Google.FindChild(ctx, ref.Account, ns, newName, false)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if existing != nil && existing.ID != ref.FolderID {
+		return newError("BucketAlreadyExists", "Drive already contains a folder named %q in the s3drive namespace", newName)
+	}
+	return nil
+}
+
 func (s *Service) RenameBucket(ctx context.Context, oldName, newName string) error {
 	if !ValidBucketName(newName) {
 		return newError("InvalidBucketName", "invalid bucket name %q", newName)
@@ -338,23 +373,7 @@ func (s *Service) RenameBucket(ctx context.Context, oldName, newName string) err
 	if ref.Pool {
 		return newError("AccessDenied", "the pool bucket cannot be renamed")
 	}
-	cfg, err := s.LoadSettings(ctx)
-	if err != nil {
-		return err
-	}
-	if newName == cfg.PoolName {
-		return newError("BucketAlreadyExists", "bucket name %q is reserved for the pool", newName)
-	}
-	if _, err := s.Store.GetBucket(ctx, newName); err == nil {
-		return newError("BucketAlreadyExists", "bucket %q already exists", newName)
-	}
-	ns, err := s.ensureNamespace(ctx, ref.Account)
-	if err != nil {
-		return err
-	}
-	if existing, err := s.Google.FindChild(ctx, ref.Account, ns, newName, false); err == nil && existing != nil && existing.ID != ref.FolderID {
-		return newError("BucketAlreadyExists", "Drive already contains a folder named %q in the s3drive namespace", newName)
-	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+	if err := s.renameTargetFree(ctx, ref, newName); err != nil {
 		return err
 	}
 	if err := s.Store.RenameBucket(ctx, oldName, newName); err != nil {
