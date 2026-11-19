@@ -10,12 +10,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -607,8 +609,28 @@ func (s *Server) popFlash(w http.ResponseWriter, r *http.Request) *flashMessage 
 	return &f
 }
 
+// removeTemp deletes a staged upload file. A failure leaves data on disk, so
+// it is logged rather than dropped.
+func (s *Server) removeTemp(path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.Log.Warn("remove upload temp file", "path", path, "err", err)
+	}
+}
+
+func (s *Server) removeDir(dir string) {
+	if err := os.RemoveAll(dir); err != nil {
+		s.Log.Warn("remove upload dir", "dir", dir, "err", err)
+	}
+}
+
+func (s *Server) removeMultipartForm(r *http.Request) {
+	if err := r.MultipartForm.RemoveAll(); err != nil {
+		s.Log.Warn("remove multipart form files", "err", err)
+	}
+}
+
 func urlQuery(s string) string {
-	return strings.ReplaceAll(fmt.Sprintf("%s", urlEscape(s)), "+", "%20")
+	return strings.ReplaceAll(urlEscape(s), "+", "%20")
 }
 
 func urlEscape(s string) string {

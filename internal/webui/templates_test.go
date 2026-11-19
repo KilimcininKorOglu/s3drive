@@ -25,7 +25,11 @@ func TestTemplatesParseAndLoginRenders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	spool := filepath.Join(dir, "tmp")
 	svc := drive.New(st, google.NewClient(st), spool, "http://localhost:8080", logger)

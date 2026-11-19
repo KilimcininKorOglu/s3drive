@@ -50,7 +50,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer st.Close()
+	defer closeLogged(st, "database", logger)
 
 	gc := google.NewClient(st)
 	svc := drive.New(st, gc, cfg.SpoolDir, cfg.PublicURL, logger)

@@ -353,7 +353,7 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
+		defer s.removeMultipartForm(r)
 	}
 	bucket := r.FormValue("bucket")
 	prefix := normalizePrefix(r.FormValue("prefix"))
@@ -388,7 +388,7 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 			ct = "application/octet-stream"
 		}
 		_, err = s.Svc.Put(r.Context(), bucket, key, ct, f)
-		f.Close()
+		_ = f.Close() // read-only upload source; Put/Copy reported read errors
 		if err != nil {
 			failed++
 			if firstErr == nil {
@@ -436,7 +436,7 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
+		defer s.removeMultipartForm(r)
 	}
 	bucket := r.FormValue("bucket")
 	prefix := normalizePrefix(r.FormValue("prefix"))
@@ -471,7 +471,7 @@ func (s *Server) uploadFolder(w http.ResponseWriter, r *http.Request) {
 			ct = "application/octet-stream"
 		}
 		_, err = s.Svc.Put(r.Context(), bucket, prefix+rel, ct, f)
-		f.Close()
+		_ = f.Close() // read-only upload source; Put/Copy reported read errors
 		if err != nil {
 			failed++
 			if firstErr == nil {
@@ -601,7 +601,7 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 	n, copyErr := io.Copy(tmp, body)
 	closeErr := tmp.Close()
 	if copyErr != nil || closeErr != nil {
-		_ = os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		if copyErr != nil {
 			http.Error(w, copyErr.Error(), http.StatusBadRequest)
 		} else {
@@ -610,22 +610,22 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if total, err := stagedUploadBytes(dir, strconv.Itoa(part)); err != nil {
-		_ = os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	} else if total+n > s.Svc.MaxObjectBytes && s.Svc.MaxObjectBytes > 0 {
-		_ = os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		http.Error(w, "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
 		return
 	} else if up.Size > 0 && total+n > up.Size {
-		_ = os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		http.Error(w, "upload exceeds the declared object size", http.StatusRequestEntityTooLarge)
 		return
 	}
 	final := filepath.Join(dir, strconv.Itoa(part))
-	_ = os.Remove(final)
+	s.removeTemp(final)
 	if err := os.Rename(tmp.Name(), final); err != nil {
-		_ = os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -681,20 +681,20 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	combinedPath := combined.Name()
-	defer os.Remove(combinedPath)
+	defer s.removeTemp(combinedPath)
 	h := md5.New() // #nosec G401 -- S3 ETag checksum
 	var total int64
 	for _, part := range parts {
 		f, err := os.Open(part.path)
 		if err != nil {
-			combined.Close()
+			_ = combined.Close() // error path; the deferred removeTemp deletes it
 			s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: err.Error()}, http.StatusInternalServerError)
 			return
 		}
 		n, copyErr := io.Copy(io.MultiWriter(combined, h), f)
-		f.Close()
+		_ = f.Close() // read-only upload source; Put/Copy reported read errors
 		if copyErr != nil {
-			combined.Close()
+			_ = combined.Close() // error path; the deferred removeTemp deletes it
 			s.filePartialStatus(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "error", Text: copyErr.Error()}, http.StatusInternalServerError)
 			return
 		}
@@ -720,7 +720,7 @@ func (s *Server) uploadComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.Store.DeleteUpload(r.Context(), up.ID)
-	_ = os.RemoveAll(dir)
+	s.removeDir(dir)
 	s.filePartial(w, r, up.Bucket, normalizePrefix(r.FormValue("prefix")), &flashMessage{Kind: "ok", Text: l.t("flash.uploaded", 1)})
 }
 
@@ -751,7 +751,7 @@ func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
 	uploadID := r.FormValue("upload_id")
 	if uploadID != "" {
 		_ = s.Store.DeleteUpload(r.Context(), uploadID)
-		_ = os.RemoveAll(s.webUploadDir(uploadID))
+		s.removeDir(s.webUploadDir(uploadID))
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -934,7 +934,7 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, l.errorText(err), http.StatusBadGateway)
 		return
 	}
-	defer obj.Body.Close()
+	defer func() { _ = obj.Body.Close() }() // read side of the download
 	name := filepath.Base(key)
 	if native {
 		name += ".pdf"
@@ -1567,7 +1567,7 @@ func validUsername(v string) bool {
 		return false
 	}
 	for _, r := range v {
-		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '.' && r != '_' && r != '-' {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '.' && r != '_' && r != '-' {
 			return false
 		}
 	}
