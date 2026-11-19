@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"s3drive/internal/pctenc"
 	"s3drive/internal/store"
 )
 
@@ -978,19 +979,7 @@ func urlEncode(s string) string {
 	return strings.ReplaceAll(queryEscape(s), "+", "%20")
 }
 
-func queryEscape(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
-			ch == '-' || ch == '_' || ch == '.' || ch == '~' {
-			b.WriteByte(ch)
-		} else {
-			fmt.Fprintf(&b, "%%%02X", ch)
-		}
-	}
-	return b.String()
-}
+func queryEscape(s string) string { return pctenc.Encode(s, false) }
 
 // Token is an OAuth token response.
 type Token struct {

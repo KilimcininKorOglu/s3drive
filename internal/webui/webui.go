@@ -27,6 +27,7 @@ import (
 	"s3drive/internal/config"
 	"s3drive/internal/drive"
 	"s3drive/internal/google"
+	"s3drive/internal/pctenc"
 	"s3drive/internal/store"
 	webassets "s3drive/web"
 )
@@ -633,16 +634,4 @@ func urlQuery(s string) string {
 	return strings.ReplaceAll(urlEscape(s), "+", "%20")
 }
 
-func urlEscape(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
-			ch == '-' || ch == '_' || ch == '.' || ch == '~' || ch == '/' {
-			b.WriteByte(ch)
-		} else {
-			fmt.Fprintf(&b, "%%%02X", ch)
-		}
-	}
-	return b.String()
-}
+func urlEscape(s string) string { return pctenc.Encode(s, true) }

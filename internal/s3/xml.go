@@ -2,10 +2,11 @@ package s3
 
 import (
 	"encoding/xml"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"s3drive/internal/pctenc"
 )
 
 const xmlNS = "http://s3.amazonaws.com/doc/2006-03-01/"
@@ -233,15 +234,5 @@ func encodeKey(key, encoding string) string {
 	if encoding != "url" {
 		return key
 	}
-	var b strings.Builder
-	for i := 0; i < len(key); i++ {
-		ch := key[i]
-		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
-			ch == '-' || ch == '_' || ch == '.' || ch == '~' || ch == '/' {
-			b.WriteByte(ch)
-		} else {
-			fmt.Fprintf(&b, "%%%02X", ch)
-		}
-	}
-	return b.String()
+	return pctenc.Encode(key, true)
 }

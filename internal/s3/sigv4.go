@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"s3drive/internal/pctenc"
 	"s3drive/internal/store"
 )
 
@@ -329,19 +330,7 @@ func encodeQuery(q url.Values) string {
 }
 
 // awsEncode implements the RFC 3986 encoding required by SigV4.
-func awsEncode(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
-			ch == '-' || ch == '_' || ch == '.' || ch == '~' {
-			b.WriteByte(ch)
-		} else {
-			fmt.Fprintf(&b, "%%%02X", ch)
-		}
-	}
-	return b.String()
-}
+func awsEncode(s string) string { return pctenc.Encode(s, false) }
 
 func signingKey(secret, date, region, service string) []byte {
 	kDate := hmacSHA256([]byte("AWS4"+secret), date)
