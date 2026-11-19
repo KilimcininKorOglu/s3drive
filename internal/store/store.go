@@ -955,7 +955,7 @@ func (s *Store) ListEvents(ctx context.Context, f EventFilter) ([]Event, int, er
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	q := `SELECT ` + eventCols + ` FROM events` + clause + ` ORDER BY id DESC LIMIT ? OFFSET ?`
+	q := `SELECT ` + eventCols + ` FROM events` + clause + ` ORDER BY id DESC LIMIT ? OFFSET ?` // #nosec G202 -- clause joins constant conditions from eventWhere; every value is a bound parameter
 	rows, err := s.db.QueryContext(ctx, q, append(args, limit, f.Offset)...)
 	if err != nil {
 		return nil, 0, err
