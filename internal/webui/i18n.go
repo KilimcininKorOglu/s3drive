@@ -791,65 +791,68 @@ func (l *lang) errorText(err error) string {
 		return l.t("err.reauth")
 	}
 	if ae, ok := errors.AsType[*google.APIError](err); ok {
-		message := strings.ToLower(ae.Message)
-		switch {
-		case ae.Status == http.StatusUnauthorized:
-			return l.t("err.reauth")
-		case ae.Status == http.StatusNotFound:
-			return l.t("err.no_such_key")
-		case ae.Status == http.StatusTooManyRequests:
-			return l.t("err.slow_down")
-		case ae.Status == http.StatusForbidden &&
-			(strings.Contains(message, "quota") || strings.Contains(message, "storage")):
-			return l.t("err.no_space")
-		case ae.Status == http.StatusForbidden:
-			return l.t("err.access_denied")
-		case ae.Status == http.StatusBadRequest:
-			return l.t("err.invalid_request")
-		default:
-			return l.t("err.internal")
-		}
+		return l.t(googleErrorKey(ae))
 	}
 	if de, ok := errors.AsType[*drive.Error](err); ok {
-		switch de.Code {
-		case "AccessDenied":
-			msg := strings.ToLower(de.Message)
-			switch {
-			case strings.Contains(msg, "reauthorized"), strings.Contains(msg, "reconnect"):
-				return l.t("err.reauth")
-			case strings.Contains(msg, "free space"):
-				return l.t("err.no_space")
-			case strings.Contains(msg, "no google account"):
-				return l.t("err.no_accounts")
-			}
-			return l.t("err.access_denied")
-		case "NoSuchBucket":
-			return l.t("err.no_such_bucket")
-		case "NoSuchKey":
-			return l.t("err.no_such_key")
-		case "BucketNotEmpty":
-			return l.t("err.bucket_not_empty")
-		case "BucketAlreadyExists":
-			return l.t("err.bucket_exists")
-		case "InvalidBucketName":
-			return l.t("err.invalid_bucket")
-		case "InvalidObjectName":
-			return l.t("err.invalid_key")
-		case "InvalidArgument", "InvalidRequest":
-			return l.t("err.invalid_request")
-		case "EntityTooLarge":
-			return l.t("err.too_large")
-		case "InsufficientStorage":
-			return l.t("err.insufficient_space")
-		case "SlowDown":
-			return l.t("err.slow_down")
-		case "InternalError":
-			return l.t("err.internal")
-		case "NotImplemented":
-			return l.t("err.not_implemented")
-		case "BadDigest":
-			return l.t("err.bad_digest")
+		if key := driveErrorKey(de); key != "" {
+			return l.t(key)
 		}
 	}
 	return l.t("flash.error", err.Error())
+}
+
+func googleErrorKey(ae *google.APIError) string {
+	message := strings.ToLower(ae.Message)
+	switch ae.Status {
+	case http.StatusUnauthorized:
+		return "err.reauth"
+	case http.StatusNotFound:
+		return "err.no_such_key"
+	case http.StatusTooManyRequests:
+		return "err.slow_down"
+	case http.StatusForbidden:
+		if strings.Contains(message, "quota") || strings.Contains(message, "storage") {
+			return "err.no_space"
+		}
+		return "err.access_denied"
+	case http.StatusBadRequest:
+		return "err.invalid_request"
+	}
+	return "err.internal"
+}
+
+// driveErrorKeys maps drive.Error codes to message keys. AccessDenied is
+// resolved separately because its message selects the key.
+var driveErrorKeys = map[string]string{
+	"NoSuchBucket":        "err.no_such_bucket",
+	"NoSuchKey":           "err.no_such_key",
+	"BucketNotEmpty":      "err.bucket_not_empty",
+	"BucketAlreadyExists": "err.bucket_exists",
+	"InvalidBucketName":   "err.invalid_bucket",
+	"InvalidObjectName":   "err.invalid_key",
+	"InvalidArgument":     "err.invalid_request",
+	"InvalidRequest":      "err.invalid_request",
+	"EntityTooLarge":      "err.too_large",
+	"InsufficientStorage": "err.insufficient_space",
+	"SlowDown":            "err.slow_down",
+	"InternalError":       "err.internal",
+	"NotImplemented":      "err.not_implemented",
+	"BadDigest":           "err.bad_digest",
+}
+
+// driveErrorKey returns the message key for de, or "" for an unmapped code.
+func driveErrorKey(de *drive.Error) string {
+	if de.Code != "AccessDenied" {
+		return driveErrorKeys[de.Code]
+	}
+	msg := strings.ToLower(de.Message)
+	switch {
+	case strings.Contains(msg, "reauthorized"), strings.Contains(msg, "reconnect"):
+		return "err.reauth"
+	case strings.Contains(msg, "free space"):
+		return "err.no_space"
+	case strings.Contains(msg, "no google account"):
+		return "err.no_accounts"
+	}
+	return "err.access_denied"
 }

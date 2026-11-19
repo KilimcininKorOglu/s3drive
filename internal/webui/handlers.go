@@ -1561,12 +1561,12 @@ func validUsername(v string) bool {
 	if len(v) < 3 || len(v) > 32 {
 		return false
 	}
-	for _, r := range v {
-		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '.' && r != '_' && r != '-' {
-			return false
-		}
-	}
-	return true
+	return !strings.ContainsFunc(v, func(r rune) bool { return !usernameRune(r) })
+}
+
+// usernameRune allows lower-case ASCII letters, digits, ".", "_" and "-".
+func usernameRune(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-'
 }
 
 func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
