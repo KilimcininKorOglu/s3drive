@@ -459,6 +459,52 @@ func (s *Service) logStoreErr(what, key string, err error) {
 }
 
 // Move moves an object to another key in the same bucket.
+// moveTarget creates the destination folders for newKey and returns the
+// parent and the encoded name. Another object at the destination blocks
+// the move; a failed lookup fails it instead of creating a duplicate name.
+func (s *Service) moveTarget(ctx context.Context, ref *BucketRef, acct *store.Account, newKey, fileID string) (string, string, error) {
+	dirs, name, err := splitKey(newKey)
+	if err != nil {
+		return "", "", err
+	}
+	folderID := ref.FolderID
+	if ref.Pool {
+		if folderID, err = s.ensurePoolFolder(ctx, acct); err != nil {
+			return "", "", err
+		}
+	}
+	parent, err := s.ensureFolder(ctx, acct, folderID, dirs)
+	if err != nil {
+		return "", "", err
+	}
+	diskName := encodeSegment(name)
+	existing, err := s.Google.FindChild(ctx, acct, parent, diskName, false)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return "", "", err
+	}
+	if err == nil && existing != nil && existing.ID != fileID {
+		return "", "", newError("InvalidArgument", "an object named %q already exists", name)
+	}
+	return parent, diskName, nil
+}
+
+// renameAndMove renames the file and moves it under parent. If the move
+// fails, the rename is rolled back so the Drive name and the S3 key stay in
+// sync.
+func (s *Service) renameAndMove(ctx context.Context, acct *store.Account, f *google.File, diskName, parent string) error {
+	if _, err := s.Google.Rename(ctx, acct, f.ID, diskName); err != nil {
+		return err
+	}
+	_, err := s.Google.Move(ctx, acct, f.ID, parent)
+	if err == nil {
+		return nil
+	}
+	if _, rerr := s.Google.Rename(ctx, acct, f.ID, f.Name); rerr != nil {
+		return errors.Join(err, fmt.Errorf("roll back rename: %w", rerr))
+	}
+	return err
+}
+
 func (s *Service) Move(ctx context.Context, bucketName, key, newKey string) error {
 	if err := ValidateKey(newKey); err != nil {
 		return err
@@ -472,53 +518,26 @@ func (s *Service) Move(ctx context.Context, bucketName, key, newKey string) erro
 	if err != nil {
 		return err
 	}
-	var previousPool *store.PoolObject
-	if ref.Pool {
-		if p, err := s.Store.GetPoolObject(ctx, newKey); err == nil {
-			previousPool = p
-		}
+	previousPool, err := s.previousPoolCopy(ctx, ref, newKey)
+	if err != nil {
+		return err
 	}
 	acct, f, err := s.locate(ctx, bucketName, key)
 	if err != nil {
 		return err
 	}
-	dirs, name, err := splitKey(newKey)
+	parent, diskName, err := s.moveTarget(ctx, ref, acct, newKey, f.ID)
 	if err != nil {
 		return err
 	}
-	var folderID string
-	if ref.Pool {
-		folderID, err = s.ensurePoolFolder(ctx, acct)
-	} else {
-		folderID = ref.FolderID
-	}
-	if err != nil {
-		return err
-	}
-	parent, err := s.ensureFolder(ctx, acct, folderID, dirs)
-	if err != nil {
-		return err
-	}
-	diskName := encodeSegment(name)
-	if existing, err := s.Google.FindChild(ctx, acct, parent, diskName, false); err == nil && existing != nil && existing.ID != f.ID {
-		return newError("InvalidArgument", "an object named %q already exists", name)
-	}
-	if _, err := s.Google.Rename(ctx, acct, f.ID, diskName); err != nil {
-		return err
-	}
-	if _, err := s.Google.Move(ctx, acct, f.ID, parent); err != nil {
-		// Best-effort rollback keeps the Drive name and the S3 key in sync.
-		if _, rerr := s.Google.Rename(ctx, acct, f.ID, f.Name); rerr != nil {
-			return errors.Join(err, fmt.Errorf("roll back rename: %w", rerr))
-		}
+	if err := s.renameAndMove(ctx, acct, f, diskName, parent); err != nil {
 		return err
 	}
 	if err := s.renameIndexes(ctx, bucketName, key, newKey); err != nil {
 		return err
 	}
-	if ref.Pool {
-		s.dropStalePoolCopy(ctx, newKey, previousPool, f.ID)
-	}
+	// previousPool is nil outside the pool, which makes this a no-op.
+	s.dropStalePoolCopy(ctx, newKey, previousPool, f.ID)
 	return nil
 }
 
