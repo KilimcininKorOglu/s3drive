@@ -198,43 +198,53 @@ func (s *Server) routes() {
 
 // ServeHTTP applies security headers, authentication and CSRF checks.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h := w.Header()
+	path := r.URL.Path
+	setSecurityHeaders(w.Header(), path)
+	if !isPublicPath(path) && !s.isAuthed(r) {
+		next := r.URL.RequestURI()
+		http.Redirect(w, r, "/login?next="+urlQuery(next), http.StatusSeeOther) // #nosec G710 -- fixed /login path; next is percent-encoded
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && !s.allowMutation(w, r, path) {
+		return
+	}
+	s.mux.ServeHTTP(w, r)
+}
+
+func setSecurityHeaders(h http.Header, path string) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Referrer-Policy", "same-origin")
 	h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 	h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'")
-	path := r.URL.Path
 	// Console pages can contain access-key secrets and account data. Static
 	// assets are not secret and may be cached normally.
 	if !strings.HasPrefix(path, "/static/") {
 		h.Set("Cache-Control", "no-store")
 	}
+}
 
-	public := path == "/login" || path == "/lang" || path == "/healthz" ||
+func isPublicPath(path string) bool {
+	return path == "/login" || path == "/lang" || path == "/healthz" ||
 		strings.HasPrefix(path, "/static/") || path == "/oauth/callback"
+}
 
-	if !public && !s.isAuthed(r) {
-		next := r.URL.RequestURI()
-		http.Redirect(w, r, "/login?next="+urlQuery(next), http.StatusSeeOther) // #nosec G710 -- fixed /login path; next is percent-encoded
-		return
+// allowMutation guards state-changing requests: it caps the body before any
+// CSRF/form parsing, enforces the admin role (viewers are read-only) before
+// the CSRF check, and then checks the CSRF token. It writes the 403 itself.
+func (s *Server) allowMutation(w http.ResponseWriter, r *http.Request, path string) bool {
+	if s.Cfg.MaxUIBodyBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, s.Cfg.MaxUIBodyBytes)
 	}
-	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-		// Limit the body before CSRF parsing. Otherwise a multipart form is
-		// parsed (and spooled) before the size guard applies.
-		if s.Cfg.MaxUIBodyBytes > 0 {
-			r.Body = http.MaxBytesReader(w, r.Body, s.Cfg.MaxUIBodyBytes)
-		}
-		if path != "/login" && path != "/logout" && path != "/lang" && s.currentRole(r) != "admin" {
-			http.Error(w, "administrator role required", http.StatusForbidden)
-			return
-		}
-		if !s.checkCSRF(r) {
-			http.Error(w, "invalid or missing CSRF token", http.StatusForbidden)
-			return
-		}
+	if path != "/login" && path != "/logout" && path != "/lang" && s.currentRole(r) != "admin" {
+		http.Error(w, "administrator role required", http.StatusForbidden)
+		return false
 	}
-	s.mux.ServeHTTP(w, r)
+	if !s.checkCSRF(r) {
+		http.Error(w, "invalid or missing CSRF token", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 type sessionInfo struct {
@@ -248,7 +258,17 @@ func (s *Server) session(r *http.Request) *sessionInfo {
 	if err != nil {
 		return nil
 	}
-	payload, sigPart, ok := strings.Cut(c.Value, ".")
+	info := s.verifySessionCookie(c.Value)
+	if info == nil {
+		return nil
+	}
+	return s.resolveSessionUser(r, info)
+}
+
+// verifySessionCookie checks the HMAC (constant time) and the expiry of an
+// "expiry|userID|role.hexmac" cookie value.
+func (s *Server) verifySessionCookie(value string) *sessionInfo {
+	payload, sigPart, ok := strings.Cut(value, ".")
 	if !ok {
 		return nil
 	}
@@ -266,7 +286,12 @@ func (s *Server) session(r *http.Request) *sessionInfo {
 	if err != nil || time.Now().Unix() >= exp {
 		return nil
 	}
-	info := &sessionInfo{UserID: parts[1], Role: parts[2]}
+	return &sessionInfo{UserID: parts[1], Role: parts[2]}
+}
+
+// resolveSessionUser loads the current username and role; a deleted user's
+// session is rejected.
+func (s *Server) resolveSessionUser(r *http.Request, info *sessionInfo) *sessionInfo {
 	if info.UserID == "env" {
 		// The env password is a break-glass admin. An open-mode session issued
 		// before the first database user must not survive once users exist.
