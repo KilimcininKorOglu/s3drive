@@ -4,6 +4,7 @@ package google
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -820,54 +821,85 @@ var errResumeGone = errors.New("resumable session expired")
 // session. Drive answers 308 with a Range header, or 200 with the file when
 // the upload already completed.
 func (c *Client) queryResumable(ctx context.Context, acct *store.Account, sessionURL string, size int64) (int64, *File, error) {
+	// The status query has an empty body and changes nothing on Drive, so it
+	// is safe to repeat.
 	for attempt := range 6 {
-		token, err := c.AccessToken(ctx, acct)
-		if err != nil {
-			return 0, nil, err
+		resp, transport, err := c.statusQuery(ctx, acct, sessionURL, size)
+		if err != nil && (!transport || ctx.Err() != nil) {
+			return 0, nil, cmp.Or(ctx.Err(), err)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, sessionURL, nil)
 		if err != nil {
-			return 0, nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Content-Range", fmt.Sprintf("bytes */%d", size))
-		resp, err := c.HTTP.Do(req)
-		if err != nil {
-			if ctx.Err() != nil {
-				return 0, nil, ctx.Err()
-			}
 			sleepBackoff(ctx, attempt)
 			continue
 		}
-		switch {
-		case resp.StatusCode == 308:
-			offset := parseRangeOffset(resp.Header.Get("Range"))
-			_ = resp.Body.Close() // status already read, body not needed
-			return offset, nil, nil
-		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
-			defer func() { _ = resp.Body.Close() }() // read-only response body
-			var raw RawFile
-			if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-				return 0, nil, err
-			}
-			f := normalizeFile(raw)
-			return 0, &f, nil
-		case resp.StatusCode == http.StatusUnauthorized:
-			_ = resp.Body.Close() // status already read, body not needed
-			if _, err := c.ForceRefresh(ctx, acct); err != nil {
-				return 0, nil, err
-			}
-		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
-			_ = resp.Body.Close() // status already read, body not needed
-			return 0, nil, errResumeGone
-		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
-			_ = readAPIError(resp)
-			sleepBackoff(ctx, attempt)
-		default:
-			return 0, nil, readAPIError(resp)
+		q := c.readQueryStatus(ctx, acct, resp, attempt)
+		if !q.retry {
+			return q.offset, q.file, q.err
 		}
 	}
 	return 0, nil, errors.New("could not query resumable upload status")
+}
+
+// statusQuery sends the "bytes */size" probe. transport reports that err
+// came from the HTTP round trip rather than from building the request.
+func (c *Client) statusQuery(ctx context.Context, acct *store.Account, sessionURL string, size int64) (*http.Response, bool, error) {
+	token, err := c.AccessToken(ctx, acct)
+	if err != nil {
+		return nil, false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, sessionURL, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+	resp, err := c.HTTP.Do(req)
+	return resp, err != nil, err
+}
+
+type queryResult struct {
+	offset int64
+	file   *File
+	err    error
+	retry  bool
+}
+
+// readQueryStatus maps the probe response: 308 gives the next offset,
+// 200/201 the completed file, 404/410 a gone session. A 401 refreshes the
+// token and 429/5xx back off before asking for another try.
+func (c *Client) readQueryStatus(ctx context.Context, acct *store.Account, resp *http.Response, attempt int) queryResult {
+	switch code := resp.StatusCode; {
+	case code == 308:
+		_ = resp.Body.Close() // status already read, body not needed
+		return queryResult{offset: parseRangeOffset(resp.Header.Get("Range"))}
+	case code == http.StatusOK || code == http.StatusCreated:
+		f, err := decodeFile(resp)
+		return queryResult{file: f, err: err}
+	case code == http.StatusUnauthorized:
+		_ = resp.Body.Close() // status already read, body not needed
+		if _, err := c.ForceRefresh(ctx, acct); err != nil {
+			return queryResult{err: err}
+		}
+		return queryResult{retry: true}
+	case code == http.StatusNotFound || code == http.StatusGone:
+		_ = resp.Body.Close() // status already read, body not needed
+		return queryResult{err: errResumeGone}
+	case code == http.StatusTooManyRequests || code >= 500:
+		_ = readAPIError(resp) // drains and closes; the query is retried
+		sleepBackoff(ctx, attempt)
+		return queryResult{retry: true}
+	}
+	return queryResult{err: readAPIError(resp)}
+}
+
+func decodeFile(resp *http.Response) (*File, error) {
+	defer func() { _ = resp.Body.Close() }() // read-only response body
+	var raw RawFile
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	f := normalizeFile(raw)
+	return &f, nil
 }
 
 func parseRangeOffset(header string) int64 {

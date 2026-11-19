@@ -2,6 +2,7 @@ package google
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -46,6 +47,46 @@ func TestDoNeverRetriesNonIdempotentMethods(t *testing.T) {
 		}
 		if n := calls.Load(); n != 1 {
 			t.Errorf("%s: sent %d times, want exactly 1", method, n)
+		}
+	}
+}
+
+// Resumable upload protocol: a 308 with "Range: bytes=0-N" means N+1 bytes
+// were stored; 404/410 means the session is gone; 5xx is retried.
+func TestQueryResumable(t *testing.T) {
+	cases := []struct {
+		name       string
+		statuses   []int
+		rangeHdr   string
+		wantOffset int64
+		wantGone   bool
+		wantCalls  int32
+	}{
+		{name: "partial", statuses: []int{308}, rangeHdr: "bytes=0-99", wantOffset: 100, wantCalls: 1},
+		{name: "nothing stored", statuses: []int{308}, wantOffset: 0, wantCalls: 1},
+		{name: "gone", statuses: []int{http.StatusNotFound}, wantGone: true, wantCalls: 1},
+		{name: "retry 5xx", statuses: []int{503, 308}, rangeHdr: "bytes=0-9", wantOffset: 10, wantCalls: 2},
+	}
+	for _, tc := range cases {
+		var calls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			i := int(calls.Add(1)) - 1
+			if r.Header.Get("Content-Range") != "bytes */500" {
+				t.Errorf("%s: Content-Range %q", tc.name, r.Header.Get("Content-Range"))
+			}
+			if tc.rangeHdr != "" {
+				w.Header().Set("Range", tc.rangeHdr)
+			}
+			w.WriteHeader(tc.statuses[min(i, len(tc.statuses)-1)])
+		}))
+		c, acct := testClient(srv)
+		offset, file, err := c.queryResumable(context.Background(), acct, srv.URL, 500)
+		srv.Close()
+		if tc.wantGone != errors.Is(err, errResumeGone) || (!tc.wantGone && err != nil) {
+			t.Errorf("%s: err %v", tc.name, err)
+		}
+		if offset != tc.wantOffset || file != nil || calls.Load() != tc.wantCalls {
+			t.Errorf("%s: offset %d file %v calls %d, want %d nil %d", tc.name, offset, file, calls.Load(), tc.wantOffset, tc.wantCalls)
 		}
 	}
 }
