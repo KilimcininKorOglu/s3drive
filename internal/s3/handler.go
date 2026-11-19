@@ -73,7 +73,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		r.Body = newPayloadReader(r.Body, auth, r.Header.Get("x-amz-trailer"))
 		r.Body = verifyPayloadHash(r.Body, auth.PayloadHash)
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }() // request body; the server closes the connection side
 	}
 
 	switch {
@@ -548,7 +548,7 @@ func setChecksumResponse(o *opCtx, checksum string) {
 
 func (s *Server) getObject(o *opCtx) {
 	rangeHeader := o.r.Header.Get("Range")
-	total := int64(-1)
+	var total int64
 	var modified time.Time
 	if rangeHeader != "" {
 		stat, _, err := s.Svc.Stat(o.r.Context(), o.bucket, o.key)
@@ -570,7 +570,7 @@ func (s *Server) getObject(o *opCtx) {
 		s.fail(o, err)
 		return
 	}
-	defer obj.Body.Close()
+	defer func() { _ = obj.Body.Close() }() // read side; copy errors are reported below
 	o.acctID = acctIDOf(obj.Account)
 	o.bytes = obj.Object.Size
 
@@ -982,16 +982,16 @@ func mapError(err error) (code, message string, status int) {
 	}
 	var ae *google.APIError
 	if errors.As(err, &ae) {
-		switch {
-		case ae.Status == http.StatusUnauthorized:
+		switch ae.Status {
+		case http.StatusUnauthorized:
 			return "AccessDenied", "the connected Google account must be reauthorized", http.StatusForbidden
-		case ae.Status == http.StatusNotFound:
+		case http.StatusNotFound:
 			return "NoSuchKey", "the specified key does not exist", http.StatusNotFound
-		case ae.Status == http.StatusForbidden:
+		case http.StatusForbidden:
 			return "AccessDenied", ae.Message, http.StatusForbidden
-		case ae.Status == http.StatusRequestedRangeNotSatisfiable:
+		case http.StatusRequestedRangeNotSatisfiable:
 			return "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable
-		case ae.Status == http.StatusTooManyRequests:
+		case http.StatusTooManyRequests:
 			return "SlowDown", "Google Drive is rate limiting requests, please retry", http.StatusServiceUnavailable
 		default:
 			return "InternalError", "Google Drive request failed", http.StatusInternalServerError

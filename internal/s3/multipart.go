@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -118,17 +119,17 @@ func (s *Server) uploadPart(o *opCtx) {
 	n, copyErr := io.Copy(io.MultiWriter(tmp, h), src)
 	closeErr := tmp.Close()
 	if copyErr == nil && n > partLimit {
-		os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "part exceeds the maximum part size", http.StatusRequestEntityTooLarge)
 		return
 	}
 	if copyErr != nil {
-		os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		s.fail(o, copyErr)
 		return
 	}
 	if closeErr != nil {
-		os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		s.fail(o, closeErr)
 		return
 	}
@@ -136,19 +137,19 @@ func (s *Server) uploadPart(o *opCtx) {
 	if v := o.r.Header.Get("Content-MD5"); v != "" {
 		raw, err := base64.StdEncoding.DecodeString(v)
 		if err != nil || len(raw) != 16 || hex.EncodeToString(raw) != sum {
-			os.Remove(tmp.Name())
+			s.removeTemp(tmp.Name())
 			writeS3Error(o.w, o.r, o.reqID, "BadDigest", "the Content-MD5 you specified did not match what we received", http.StatusBadRequest)
 			return
 		}
 	}
 	if total, err := stagedUploadBytes(dir, strconv.Itoa(partNumber)); err == nil &&
 		s.Svc.MaxObjectBytes > 0 && total+n > s.Svc.MaxObjectBytes {
-		os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
 		return
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
-		os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		s.fail(o, err)
 		return
 	}
@@ -190,7 +191,7 @@ func (s *Server) uploadPartCopy(o *opCtx, uploadID string, partNumber int) {
 		s.fail(o, err)
 		return
 	}
-	defer src.Body.Close()
+	defer func() { _ = src.Body.Close() }() // read side of the copy source
 
 	dir := s.uploadDir(uploadID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -206,12 +207,12 @@ func (s *Server) uploadPartCopy(o *opCtx, uploadID string, partNumber int) {
 	n, copyErr := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(src.Body, partLimit+1))
 	closeErr := tmp.Close()
 	if copyErr == nil && n > partLimit {
-		os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "part exceeds the maximum part size", http.StatusRequestEntityTooLarge)
 		return
 	}
 	if copyErr != nil || closeErr != nil {
-		os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		if copyErr != nil {
 			s.fail(o, copyErr)
 		} else {
@@ -223,12 +224,12 @@ func (s *Server) uploadPartCopy(o *opCtx, uploadID string, partNumber int) {
 	path := filepath.Join(dir, strconv.Itoa(partNumber))
 	if total, err := stagedUploadBytes(dir, strconv.Itoa(partNumber)); err == nil &&
 		s.Svc.MaxObjectBytes > 0 && total+n > s.Svc.MaxObjectBytes {
-		os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		writeS3Error(o.w, o.r, o.reqID, "EntityTooLarge", "object exceeds the configured size limit", http.StatusRequestEntityTooLarge)
 		return
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
-		os.Remove(tmp.Name())
+		s.removeTemp(tmp.Name())
 		s.fail(o, err)
 		return
 	}
@@ -266,7 +267,7 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 		return
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	defer s.removeTemp(tmpPath)
 
 	fullHash := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
 	partHashes := make([]byte, 0, len(req.Parts)*md5.Size)
@@ -274,7 +275,7 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 	var total int64
 	for _, part := range req.Parts {
 		if part.PartNumber < 1 || seen[part.PartNumber] {
-			tmp.Close()
+			_ = tmp.Close() // error path: the temp file is removed by the deferred removeTemp
 			writeS3Error(o.w, o.r, o.reqID, "InvalidPart", "part numbers must be unique and positive", http.StatusBadRequest)
 			return
 		}
@@ -282,22 +283,22 @@ func (s *Server) completeMultipartUpload(o *opCtx) {
 		path := filepath.Join(dir, strconv.Itoa(part.PartNumber))
 		f, err := os.Open(path) // #nosec G304 -- spool path: safeUploadID keeps [a-z0-9], part number is an int
 		if err != nil {
-			tmp.Close()
+			_ = tmp.Close() // error path: the temp file is removed by the deferred removeTemp
 			writeS3Error(o.w, o.r, o.reqID, "InvalidPart", fmt.Sprintf("part %d was not uploaded", part.PartNumber), http.StatusBadRequest)
 			return
 		}
 		partHash := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
 		n, err := io.Copy(io.MultiWriter(tmp, fullHash, partHash), f)
-		f.Close()
+		_ = f.Close() // read-only part file; io.Copy reported read errors
 		if err != nil {
-			tmp.Close()
+			_ = tmp.Close() // error path: the temp file is removed by the deferred removeTemp
 			s.fail(o, err)
 			return
 		}
 		expected := strings.Trim(part.ETag, `"`)
 		actual := hex.EncodeToString(partHash.Sum(nil))
 		if expected != "" && !strings.EqualFold(expected, actual) {
-			tmp.Close()
+			_ = tmp.Close() // error path: the temp file is removed by the deferred removeTemp
 			writeS3Error(o.w, o.r, o.reqID, "InvalidPart", fmt.Sprintf("part %d ETag does not match", part.PartNumber), http.StatusBadRequest)
 			return
 		}
@@ -523,6 +524,14 @@ func (s *Server) noSuchUpload(o *opCtx) {
 	writeS3Error(o.w, o.r, o.reqID, "NoSuchUpload", "the specified multipart upload does not exist", http.StatusNotFound)
 }
 
+// removeTemp deletes a spool temp file. A failure leaves data on disk, so it
+// is logged rather than dropped.
+func (s *Server) removeTemp(path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.Log.Warn("remove multipart temp file", "path", path, "err", err)
+	}
+}
+
 func (s *Server) uploadDir(uploadID string) string {
 	return filepath.Join(s.SpoolDir, "multipart", safeUploadID(uploadID))
 }
@@ -560,7 +569,7 @@ func fileMD5(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // read-only part file
 	h := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
