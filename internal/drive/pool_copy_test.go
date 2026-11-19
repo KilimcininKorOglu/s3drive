@@ -15,23 +15,35 @@ func TestPreviousPoolCopy(t *testing.T) {
 	st := openStore(t)
 	svc := &Service{Store: st}
 	pool, pinned := &BucketRef{Pool: true}, &BucketRef{}
-
-	if p, err := svc.previousPoolCopy(ctx, pool, "missing"); p != nil || err != nil {
-		t.Fatalf("missing entry: %v, %v; want nil, nil", p, err)
-	}
 	if err := st.PutPoolObject(ctx, store.PoolObject{Key: "k", AccountID: "a", FileID: "f1", Size: 3}); err != nil {
 		t.Fatal(err)
 	}
-	if p, err := svc.previousPoolCopy(ctx, pool, "k"); err != nil || p == nil || p.FileID != "f1" {
-		t.Fatalf("existing entry: %+v, %v", p, err)
+	cases := []struct {
+		name    string
+		ref     *BucketRef
+		key     string
+		wantID  string // "" means no previous copy
+		closeDB bool
+		wantErr bool
+	}{
+		{"missing entry", pool, "missing", "", false, false},
+		{"existing entry", pool, "k", "f1", false, false},
+		{"pinned bucket", pinned, "k", "", false, false},
+		{"unreadable index", pool, "k", "", true, true},
 	}
-	if p, err := svc.previousPoolCopy(ctx, pinned, "k"); p != nil || err != nil {
-		t.Fatalf("pinned bucket: %v, %v; want nil, nil", p, err)
-	}
-	if err := st.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.previousPoolCopy(ctx, pool, "k"); err == nil {
-		t.Fatal("unreadable pool index accepted")
+	for _, c := range cases {
+		if c.closeDB {
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		p, err := svc.previousPoolCopy(ctx, c.ref, c.key)
+		gotID := ""
+		if p != nil {
+			gotID = p.FileID
+		}
+		if (err != nil) != c.wantErr || gotID != c.wantID {
+			t.Errorf("%s: file %q err %v, want %q wantErr=%v", c.name, gotID, err, c.wantID, c.wantErr)
+		}
 	}
 }
