@@ -1450,10 +1450,11 @@ func (s *Store) CreateOAuthState(ctx context.Context, state, verifier, accountID
 }
 
 // ConsumeOAuthState returns and deletes a state. States older than 15 minutes
-// are rejected.
+// are rejected. Deleting and reading in one statement makes a state
+// single-use even when callbacks race.
 func (s *Store) ConsumeOAuthState(ctx context.Context, state string) (verifier, accountID string, err error) {
 	var created int64
-	err = s.db.QueryRowContext(ctx, `SELECT verifier,account_id,created_at FROM oauth_states WHERE state=?`, state).
+	err = s.db.QueryRowContext(ctx, `DELETE FROM oauth_states WHERE state=? RETURNING verifier,account_id,created_at`, state).
 		Scan(&verifier, &accountID, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", ErrNotFound
@@ -1461,7 +1462,6 @@ func (s *Store) ConsumeOAuthState(ctx context.Context, state string) (verifier, 
 	if err != nil {
 		return "", "", err
 	}
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM oauth_states WHERE state=?`, state)
 	if time.Since(fromUnix(created)) > 15*time.Minute {
 		return "", "", ErrExpired
 	}
