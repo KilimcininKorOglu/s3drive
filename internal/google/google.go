@@ -734,39 +734,52 @@ func (c *Client) uploadMultipart(ctx context.Context, acct *store.Account, exist
 
 const chunkSize = 32 << 20 // multiple of 256 KiB, as Drive requires
 
+// resumeOrStart continues a stored session (or returns the file it already
+// completed), else starts a new session at offset 0 and stores it so a
+// restart can resume.
+func (c *Client) resumeOrStart(ctx context.Context, acct *store.Account, resume *UploadResume, start func() (string, error)) (string, int64, *File, error) {
+	sessionURL, offset, done, err := c.prepareResume(ctx, acct, resume)
+	if err != nil || done != nil || sessionURL != "" {
+		return sessionURL, offset, done, err
+	}
+	if sessionURL, err = start(); err != nil {
+		return "", 0, nil, err
+	}
+	if err := c.saveResume(ctx, resume, sessionURL, 0); err != nil {
+		return "", 0, nil, err
+	}
+	return sessionURL, 0, nil, nil
+}
+
+// seekToOffset positions r for the session. An offset outside the file, or
+// a full offset without a completed file from the query, means the session
+// is stale: it is dropped and usable is false.
+func (c *Client) seekToOffset(ctx context.Context, r io.Seeker, offset, size int64, resume *UploadResume) (bool, error) {
+	if offset < 0 || offset >= size {
+		return false, c.dropResume(ctx, resume)
+	}
+	if _, err := r.Seek(offset, io.SeekStart); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (c *Client) uploadResumable(ctx context.Context, acct *store.Account, existingID, parentID, name, mime string, r io.ReadSeeker, size int64, resume *UploadResume) (*File, error) {
+	start := func() (string, error) {
+		return c.startResumable(ctx, acct, existingID, parentID, name, mime, size)
+	}
 	var lastErr error
 	for range 3 {
-		sessionURL, offset, done, err := c.prepareResume(ctx, acct, resume)
+		sessionURL, offset, done, err := c.resumeOrStart(ctx, acct, resume, start)
+		if err != nil || done != nil {
+			return done, err
+		}
+		usable, err := c.seekToOffset(ctx, r, offset, size, resume)
 		if err != nil {
 			return nil, err
 		}
-		if done != nil {
-			return done, nil
-		}
-		if sessionURL == "" {
-			if _, err := r.Seek(0, io.SeekStart); err != nil {
-				return nil, err
-			}
-			sessionURL, err = c.startResumable(ctx, acct, existingID, parentID, name, mime, size)
-			if err != nil {
-				return nil, err
-			}
-			offset = 0
-			if err := c.saveResume(ctx, resume, sessionURL, 0); err != nil {
-				return nil, err
-			}
-		}
-		// An offset outside the file, or a full offset without a completed
-		// file from the query, means the session is stale: drop it and restart.
-		if offset > size || offset < 0 || offset == size {
-			if err := c.dropResume(ctx, resume); err != nil {
-				return nil, err
-			}
+		if !usable {
 			continue
-		}
-		if _, err := r.Seek(offset, io.SeekStart); err != nil {
-			return nil, err
 		}
 		file, retry, err := c.putResumableChunks(ctx, acct, sessionURL, r, size, offset, resume)
 		if err == nil {
@@ -787,6 +800,13 @@ func (c *Client) uploadResumable(ctx context.Context, acct *store.Account, exist
 // prepareResume looks up a persisted session and asks Drive how many bytes it
 // has committed. It returns a completed file when the previous attempt actually
 // finished before the process stopped.
+// sessionMatches reports whether a stored session belongs to this exact
+// upload (same account, content identity and size).
+func sessionMatches(d *store.DriveSession, resume *UploadResume) bool {
+	return d.SessionURL != "" && d.AccountID == resume.AccountID &&
+		d.Identity == resume.Identity && d.Size == resume.Size
+}
+
 func (c *Client) prepareResume(ctx context.Context, acct *store.Account, resume *UploadResume) (string, int64, *File, error) {
 	if resume == nil {
 		return "", 0, nil, nil
@@ -798,7 +818,7 @@ func (c *Client) prepareResume(ctx context.Context, acct *store.Account, resume 
 	if err != nil {
 		return "", 0, nil, err
 	}
-	if d.AccountID != resume.AccountID || d.Identity != resume.Identity || d.Size != resume.Size || d.SessionURL == "" {
+	if !sessionMatches(d, resume) {
 		return "", 0, nil, c.dropResume(ctx, resume)
 	}
 	offset, file, err := c.queryResumable(ctx, acct, d.SessionURL, resume.Size)
