@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"s3drive/internal/config"
@@ -16,6 +17,24 @@ import (
 )
 
 func TestTemplatesParseAndLoginRenders(t *testing.T) {
+	srv := newTestServer(t)
+	for _, lang := range []string{"en", "tr"} {
+		req := httptest.NewRequest(http.MethodGet, "/login", nil)
+		req.AddCookie(&http.Cookie{Name: "lang", Value: lang})
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s login status = %d: %s", lang, rec.Code, rec.Body.String())
+		}
+		if len(rec.Body.Bytes()) < 500 {
+			t.Fatalf("%s login page too small", lang)
+		}
+	}
+}
+
+// newTestServer builds a console on a temp store with no Google account.
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
 	dir := t.TempDir()
 	box, err := secure.New(dir, "0000000000000000000000000000000000000000000000000000000000000000")
 	if err != nil {
@@ -40,17 +59,18 @@ func TestTemplatesParseAndLoginRenders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("template parse: %v", err)
 	}
+	return srv
+}
 
-	for _, lang := range []string{"en", "tr"} {
-		req := httptest.NewRequest(http.MethodGet, "/login", nil)
-		req.AddCookie(&http.Cookie{Name: "lang", Value: lang})
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("%s login status = %d: %s", lang, rec.Code, rec.Body.String())
-		}
-		if len(rec.Body.Bytes()) < 500 {
-			t.Fatalf("%s login page too small", lang)
-		}
+// A malformed bulk-delete form must be reported, not read as an empty
+// selection.
+func TestBulkDeleteReportsMalformedForm(t *testing.T) {
+	srv := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/files/bulk-delete", strings.NewReader("bucket=b&keys=a%zz"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	srv.bulkDelete(rec, req)
+	if !strings.Contains(rec.Body.String(), "invalid URL escape") {
+		t.Fatalf("parse error not shown; body: %.300s", rec.Body.String())
 	}
 }

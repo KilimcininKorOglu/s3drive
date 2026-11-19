@@ -890,10 +890,13 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) bulkDelete(w http.ResponseWriter, r *http.Request) {
 	l := s.t(r)
+	// Parse first: FormValue would parse the form and drop the error, and
+	// ParseForm does not parse it again.
+	parseErr := r.ParseForm()
 	bucket := r.FormValue("bucket")
 	prefix := normalizePrefix(r.FormValue("prefix"))
-	if err := r.ParseForm(); err != nil {
-		s.filePartial(w, r, bucket, prefix, &flashMessage{Kind: "error", Text: err.Error()})
+	if parseErr != nil {
+		s.filePartial(w, r, bucket, prefix, &flashMessage{Kind: "error", Text: parseErr.Error()})
 		return
 	}
 	keys := r.Form["keys"]
