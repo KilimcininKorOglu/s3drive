@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,6 +34,119 @@ func (s *Service) Put(ctx context.Context, bucketName, key, contentType string, 
 	return s.putFile(ctx, bucketName, key, contentType, path, size, sum)
 }
 
+// reserveWrite picks the target account and folder and holds the pool space
+// reservation, the daily upload budget and an upload slot until release.
+func (s *Service) reserveWrite(ctx context.Context, ref *BucketRef, size int64) (*store.Account, string, func(), error) {
+	s.reserveMu.Lock()
+	acct, folderID, err := s.writeTarget(ctx, ref, size)
+	if err == nil && ref.Pool {
+		s.addReservation(acct.ID, size)
+	}
+	s.reserveMu.Unlock()
+	if err != nil {
+		return nil, "", nil, err
+	}
+	releases := []func(){}
+	releaseAll := func() {
+		for _, r := range slices.Backward(releases) {
+			r()
+		}
+	}
+	if ref.Pool {
+		releases = append(releases, func() { s.addReservation(acct.ID, -size) })
+	}
+	releaseDaily, err := s.reserveDaily(ctx, acct, size)
+	if err != nil {
+		releaseAll()
+		return nil, "", nil, err
+	}
+	releases = append(releases, releaseDaily)
+	releaseSlot, err := s.acquireUploadSlot(ctx, acct)
+	if err != nil {
+		releaseAll()
+		return nil, "", nil, err
+	}
+	releases = append(releases, releaseSlot)
+	return acct, folderID, releaseAll, nil
+}
+
+// writeLocation creates the key's parent folders and returns the parent id
+// and the id of a file the write replaces ("" for a new file).
+func (s *Service) writeLocation(ctx context.Context, acct *store.Account, folderID string, dirs []string, name string) (string, string, error) {
+	parent, err := s.ensureFolder(ctx, acct, folderID, dirs)
+	if err != nil {
+		return "", "", err
+	}
+	existingID, err := s.replaceableFile(ctx, acct, parent, encodeSegment(name), name)
+	return parent, existingID, err
+}
+
+// replaceableFile returns the id of an existing file with the same name, or
+// "" when there is none. A folder of that name blocks the write.
+func (s *Service) replaceableFile(ctx context.Context, acct *store.Account, parent, diskName, name string) (string, error) {
+	existing, err := s.Google.FindChild(ctx, acct, parent, diskName, false)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && existing == nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if existing.IsFolder {
+		return "", newError("InvalidArgument", "a folder named %q already exists", name)
+	}
+	return existing.ID, nil
+}
+
+// previousPoolCopy returns the pool index entry the upload will replace.
+// A lookup error fails the upload: without it the old copy could not be
+// cleaned up and would keep using quota.
+func (s *Service) previousPoolCopy(ctx context.Context, ref *BucketRef, key string) (*store.PoolObject, error) {
+	if !ref.Pool {
+		return nil, nil
+	}
+	p, err := s.Store.GetPoolObject(ctx, key)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	return p, err
+}
+
+// recordUpload counts the bytes against the daily budget and, for the pool,
+// updates the index.
+func (s *Service) recordUpload(ctx context.Context, ref *BucketRef, key, accountID, fileID string, size int64, previous *store.PoolObject) error {
+	if err := s.Store.AddUploadUsage(ctx, accountID, size); err != nil {
+		s.Log.Warn("record daily upload usage", "account", accountID, "err", err)
+	}
+	if !ref.Pool {
+		return nil
+	}
+	return s.indexPoolUpload(ctx, key, accountID, fileID, size, previous)
+}
+
+// indexPoolUpload points the pool index at the new file before the old copy
+// goes; otherwise the key would resolve to a deleted file. The stale copy
+// is then dropped so it does not consume quota or reappear when the index
+// is rebuilt.
+func (s *Service) indexPoolUpload(ctx context.Context, key, accountID, fileID string, size int64, previous *store.PoolObject) error {
+	if err := s.Store.PutPoolObject(ctx, store.PoolObject{
+		Key: key, AccountID: accountID, FileID: fileID, Size: size,
+	}); err != nil {
+		return fmt.Errorf("update pool index: %w", err)
+	}
+	s.dropStalePoolCopy(ctx, key, previous, fileID)
+	return nil
+}
+
+// uploadSpool uploads a spool file, creating or replacing existingID.
+func (s *Service) uploadSpool(ctx context.Context, acct *store.Account, existingID, parent, diskName, contentType, path string, resume *google.UploadResume) (*google.File, error) {
+	f, err := os.Open(path) // #nosec G304 -- spool file created by os.CreateTemp, not client input
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }() // read-only spool file
+	return s.Google.Upload(ctx, acct, existingID, parent, diskName, contentType, f, resume.Size, resume)
+}
+
 func (s *Service) putFile(ctx context.Context, bucketName, key, contentType, path string, size int64, md5hex string) (*PutResult, error) {
 	ref, err := s.Bucket(ctx, bucketName)
 	if err != nil {
@@ -45,84 +159,32 @@ func (s *Service) putFile(ctx context.Context, bucketName, key, contentType, pat
 	unlockObject := s.lockObjects(bucketName + "/" + key)
 	defer unlockObject()
 
-	s.reserveMu.Lock()
-	acct, folderID, err := s.writeTarget(ctx, ref, size)
-	if err == nil && ref.Pool {
-		s.addReservation(acct.ID, size)
-	}
-	s.reserveMu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	if ref.Pool {
-		defer s.addReservation(acct.ID, -size)
-	}
-	releaseDaily, err := s.reserveDaily(ctx, acct, size)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseDaily()
-	release, err := s.acquireUploadSlot(ctx, acct)
+	acct, folderID, release, err := s.reserveWrite(ctx, ref, size)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	parent, err := s.ensureFolder(ctx, acct, folderID, dirs)
-	if err != nil {
-		return nil, err
-	}
-
 	diskName := encodeSegment(name)
-	existing, err := s.Google.FindChild(ctx, acct, parent, diskName, false)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, err
-	}
-	if existing != nil && existing.IsFolder {
-		return nil, newError("InvalidArgument", "a folder named %q already exists", name)
-	}
-
-	f, err := os.Open(path) // #nosec G304 -- spool file created by os.CreateTemp, not client input
+	parent, existingID, err := s.writeLocation(ctx, acct, folderID, dirs, name)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }() // read-only spool file
+	previous, err := s.previousPoolCopy(ctx, ref, key)
+	if err != nil {
+		return nil, err
+	}
 
-	existingID := ""
-	if existing != nil {
-		existingID = existing.ID
-	}
-	var previous *store.PoolObject
-	if ref.Pool {
-		if p, err := s.Store.GetPoolObject(ctx, key); err == nil {
-			previous = p
-		}
-	}
-	resumeIdentity := md5hex
+	resume := &google.UploadResume{Bucket: bucketName, Key: key, AccountID: acct.ID, Identity: md5hex, Size: size}
 	if existingID != "" {
-		resumeIdentity += ":" + existingID
+		resume.Identity += ":" + existingID
 	}
-	uploaded, err := s.Google.Upload(ctx, acct, existingID, parent, diskName, contentType, f, size,
-		&google.UploadResume{Bucket: bucketName, Key: key, AccountID: acct.ID, Identity: resumeIdentity, Size: size})
+	uploaded, err := s.uploadSpool(ctx, acct, existingID, parent, diskName, contentType, path, resume)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.Store.AddUploadUsage(ctx, acct.ID, size); err != nil {
-		s.Log.Warn("record daily upload usage", "account", acct.ID, "err", err)
+	if err := s.recordUpload(ctx, ref, key, acct.ID, uploaded.ID, size, previous); err != nil {
+		return nil, err
 	}
-
-	if ref.Pool {
-		// The index must point at the new file before the old copy goes;
-		// otherwise the key would resolve to a deleted file.
-		if err := s.Store.PutPoolObject(ctx, store.PoolObject{
-			Key: key, AccountID: acct.ID, FileID: uploaded.ID, Size: size,
-		}); err != nil {
-			return nil, fmt.Errorf("update pool index: %w", err)
-		}
-		// The key moved to another file/account; drop the stale copy so it
-		// does not consume quota or reappear when the index is rebuilt.
-		s.dropStalePoolCopy(ctx, key, previous, uploaded.ID)
-	}
-
 	return &PutResult{
 		ETag: md5hex, Size: size, FileID: uploaded.ID, AccountID: acct.ID,
 		Modified: uploaded.Modified,
