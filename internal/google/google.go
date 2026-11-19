@@ -140,8 +140,11 @@ func (c *Client) refreshLocked(ctx context.Context, acct *store.Account, st *tok
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	defer func() { _ = resp.Body.Close() }() // body fully read below
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("read token response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		var oe struct {
 			Error            string `json:"error"`
@@ -149,8 +152,11 @@ func (c *Client) refreshLocked(ctx context.Context, acct *store.Account, st *tok
 		}
 		_ = json.Unmarshal(body, &oe)
 		if oe.Error == "invalid_grant" || oe.Error == "unauthorized_client" {
-			_ = c.Store.MarkAccountReauth(ctx, acct.ID)
-			return "", fmt.Errorf("%w: %s", ErrReauth, oe.ErrorDescription)
+			reauthErr := fmt.Errorf("%w: %s", ErrReauth, oe.ErrorDescription)
+			if err := c.Store.MarkAccountReauth(ctx, acct.ID); err != nil {
+				return "", errors.Join(reauthErr, fmt.Errorf("mark account for re-auth: %w", err))
+			}
+			return "", reauthErr
 		}
 		return "", fmt.Errorf("token refresh failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -219,7 +225,7 @@ func (c *Client) do(ctx context.Context, acct *store.Account, method, url string
 			continue
 		}
 		if resp.StatusCode == http.StatusUnauthorized && !refreshed {
-			resp.Body.Close()
+			_ = resp.Body.Close() // discarded 401 response, retried after refresh
 			refreshed = true
 			if _, err := c.ForceRefresh(ctx, acct); err != nil {
 				return nil, err
@@ -246,7 +252,7 @@ func (c *Client) do(ctx context.Context, acct *store.Account, method, url string
 }
 
 func readAPIError(resp *http.Response) error {
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // error body, already consumed
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var payload struct {
 		Error struct {
@@ -331,7 +337,7 @@ func (c *Client) RootFolderID(ctx context.Context, acct *store.Account) (string,
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var f RawFile
 	if err := json.NewDecoder(resp.Body).Decode(&f); err != nil {
 		return "", err
@@ -346,7 +352,7 @@ func (c *Client) About(ctx context.Context, acct *store.Account) (*About, error)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var raw struct {
 		User struct {
 			DisplayName  string `json:"displayName"`
@@ -397,7 +403,7 @@ func (c *Client) ListChildren(ctx context.Context, acct *store.Account, parentID
 	if err != nil {
 		return nil, "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var payload struct {
 		NextPageToken string    `json:"nextPageToken"`
 		Files         []RawFile `json:"files"`
@@ -423,7 +429,7 @@ func (c *Client) FindChild(ctx context.Context, acct *store.Account, parentID, n
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var payload struct {
 		Files []RawFile `json:"files"`
 	}
@@ -444,7 +450,7 @@ func (c *Client) GetFile(ctx context.Context, acct *store.Account, id string) (*
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var raw RawFile
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
@@ -476,7 +482,7 @@ func (c *Client) CreateFolderWithProps(ctx context.Context, acct *store.Account,
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var raw RawFile
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
@@ -493,7 +499,7 @@ func (c *Client) Rename(ctx context.Context, acct *store.Account, id, name strin
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var raw RawFile
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
@@ -524,7 +530,7 @@ func (c *Client) Move(ctx context.Context, acct *store.Account, id, newParent st
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var raw RawFile
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
@@ -541,7 +547,7 @@ func (c *Client) SetAppProperties(ctx context.Context, acct *store.Account, id s
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var raw RawFile
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
@@ -556,7 +562,7 @@ func (c *Client) Delete(ctx context.Context, acct *store.Account, id string) err
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close() // status already read, body not needed
 	return nil
 }
 
@@ -568,7 +574,7 @@ func (c *Client) Copy(ctx context.Context, acct *store.Account, id, name, parent
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var raw RawFile
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
@@ -653,7 +659,7 @@ func (c *Client) uploadMultipart(ctx context.Context, acct *store.Account, exist
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	var raw RawFile
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
@@ -687,15 +693,12 @@ func (c *Client) uploadResumable(ctx context.Context, acct *store.Account, exist
 				return nil, err
 			}
 		}
-		if offset > size || offset < 0 {
-			_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
-			sessionURL = ""
-			continue
-		}
-		if offset == size {
-			// A query normally returns the completed file in this case. If it
-			// did not, abandon the stale session and upload again.
-			_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
+		// An offset outside the file, or a full offset without a completed
+		// file from the query, means the session is stale: drop it and restart.
+		if offset > size || offset < 0 || offset == size {
+			if err := c.dropResume(ctx, resume); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if _, err := r.Seek(offset, io.SeekStart); err != nil {
@@ -703,7 +706,9 @@ func (c *Client) uploadResumable(ctx context.Context, acct *store.Account, exist
 		}
 		file, retry, err := c.putResumableChunks(ctx, acct, sessionURL, r, size, offset, resume)
 		if err == nil {
-			_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
+			if err := c.dropResume(ctx, resume); err != nil {
+				return nil, err
+			}
 			return file, nil
 		}
 		lastErr = err
@@ -732,19 +737,19 @@ func (c *Client) prepareResume(ctx context.Context, acct *store.Account, resume 
 		return "", 0, nil, err
 	}
 	if d.AccountID != resume.AccountID || d.Identity != resume.Identity || d.Size != resume.Size || d.SessionURL == "" {
-		_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
-		return "", 0, nil, nil
+		return "", 0, nil, c.dropResume(ctx, resume)
 	}
 	offset, file, err := c.queryResumable(ctx, acct, d.SessionURL, resume.Size)
 	if errors.Is(err, errResumeGone) {
-		_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
-		return "", 0, nil, nil
+		return "", 0, nil, c.dropResume(ctx, resume)
 	}
 	if err != nil {
 		return "", 0, nil, err
 	}
 	if file != nil {
-		_ = c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key)
+		if err := c.dropResume(ctx, resume); err != nil {
+			return "", 0, nil, err
+		}
 		return "", 0, file, nil
 	}
 	return d.SessionURL, offset, nil, nil
@@ -778,10 +783,10 @@ func (c *Client) queryResumable(ctx context.Context, acct *store.Account, sessio
 		switch {
 		case resp.StatusCode == 308:
 			offset := parseRangeOffset(resp.Header.Get("Range"))
-			resp.Body.Close()
+			_ = resp.Body.Close() // status already read, body not needed
 			return offset, nil, nil
 		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }() // read-only response body
 			var raw RawFile
 			if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 				return 0, nil, err
@@ -789,12 +794,12 @@ func (c *Client) queryResumable(ctx context.Context, acct *store.Account, sessio
 			f := normalizeFile(raw)
 			return 0, &f, nil
 		case resp.StatusCode == http.StatusUnauthorized:
-			resp.Body.Close()
+			_ = resp.Body.Close() // status already read, body not needed
 			if _, err := c.ForceRefresh(ctx, acct); err != nil {
 				return 0, nil, err
 			}
 		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
-			resp.Body.Close()
+			_ = resp.Body.Close() // status already read, body not needed
 			return 0, nil, errResumeGone
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 			_ = readAPIError(resp)
@@ -818,6 +823,15 @@ func parseRangeOffset(header string) int64 {
 		return 0
 	}
 	return n + 1
+}
+
+// dropResume deletes a stale resumable session so the next attempt starts a
+// new one. A failure is returned: a kept stale session would be reused.
+func (c *Client) dropResume(ctx context.Context, resume *UploadResume) error {
+	if err := c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key); err != nil {
+		return fmt.Errorf("drop stale upload session: %w", err)
+	}
+	return nil
 }
 
 func (c *Client) saveResume(ctx context.Context, resume *UploadResume, sessionURL string, offset int64) error {
@@ -850,7 +864,7 @@ func (c *Client) startResumable(ctx context.Context, acct *store.Account, existi
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only response body
 	session := resp.Header.Get("Location")
 	if session == "" {
 		return "", errors.New("drive did not return a resumable session URL")
@@ -899,7 +913,7 @@ func (c *Client) putResumableChunks(ctx context.Context, acct *store.Account, se
 				} else {
 					offset += n
 				}
-				resp.Body.Close()
+				_ = resp.Body.Close() // status already read, body not needed
 				if _, err := r.Seek(offset, io.SeekStart); err != nil {
 					return nil, false, err
 				}
@@ -909,7 +923,7 @@ func (c *Client) putResumableChunks(ctx context.Context, acct *store.Account, se
 				lastErr = nil
 				goto nextChunk
 			case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
-				defer resp.Body.Close()
+				defer func() { _ = resp.Body.Close() }() // read-only response body
 				var raw RawFile
 				if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 					return nil, false, err
@@ -917,7 +931,7 @@ func (c *Client) putResumableChunks(ctx context.Context, acct *store.Account, se
 				f := normalizeFile(raw)
 				return &f, false, nil
 			case resp.StatusCode == 401:
-				resp.Body.Close()
+				_ = resp.Body.Close() // status already read, body not needed
 				if _, err := c.ForceRefresh(ctx, acct); err != nil {
 					return nil, false, err
 				}

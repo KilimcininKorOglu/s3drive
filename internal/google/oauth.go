@@ -127,8 +127,11 @@ func (c *Client) Exchange(ctx context.Context, cfg OAuthConfig, code, verifier s
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	defer func() { _ = resp.Body.Close() }() // body fully read below
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read token response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		var oe struct {
 			Error            string `json:"error"`
