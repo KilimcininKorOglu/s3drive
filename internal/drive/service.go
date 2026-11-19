@@ -714,117 +714,177 @@ func (s *Service) list(ctx context.Context, bucketName, prefix, delimiter string
 	if delimiter != "" && delimiter != "/" {
 		return s.listWithCustomDelimiter(ctx, bucketName, prefix, delimiter, maxKeys, after)
 	}
-	if !ref.Pool {
-		dirs, namePrefix, err := splitPrefix(prefix)
-		if err != nil {
-			return nil, err
-		}
-		folder, err := s.findFolder(ctx, ref.Account, ref.FolderID, dirs)
-		if errors.Is(err, store.ErrNotFound) {
-			return &ListResult{}, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		res := &ListResult{}
-		state := &listState{
-			prefix: prefix, namePrefix: namePrefix, delimiter: delimiter,
-			after: after, limit: maxKeys, res: res, seen: map[string]bool{},
-			account: ref.Account, includeDocs: includeDocs,
-		}
-		if err := s.walk(ctx, state, folder, keyBase(dirPrefix(prefix))); err != nil && !errors.Is(err, errListStop) {
-			return nil, err
-		}
-		for i := range res.Objects {
-			s.enrichObject(ctx, bucketName, &res.Objects[i])
-		}
-		return res, nil
+	q := listQuery{prefix: prefix, delimiter: delimiter, after: after, includeDocs: includeDocs}
+	var res *ListResult
+	if ref.Pool {
+		res, err = s.listPool(ctx, q, maxKeys)
+	} else {
+		res, err = s.listPinned(ctx, ref, q, maxKeys)
 	}
+	if err != nil {
+		return nil, err
+	}
+	for i := range res.Objects {
+		s.enrichObject(ctx, bucketName, &res.Objects[i])
+	}
+	return res, nil
+}
 
-	// Pool: list each account's pool folder and merge.
+// listQuery is the part of a listing request shared by every folder walk.
+type listQuery struct {
+	prefix, delimiter, after string
+	includeDocs              bool
+}
+
+func (q listQuery) state(acct *store.Account, namePrefix string, limit int, res *ListResult) *listState {
+	return &listState{
+		prefix: q.prefix, namePrefix: namePrefix, delimiter: q.delimiter,
+		after: q.after, limit: limit, res: res, seen: map[string]bool{},
+		account: acct, includeDocs: q.includeDocs,
+	}
+}
+
+// listPinned walks the bucket folder of a pinned bucket; a missing prefix
+// folder is an empty listing.
+func (s *Service) listPinned(ctx context.Context, ref *BucketRef, q listQuery, maxKeys int) (*ListResult, error) {
+	dirs, namePrefix, err := splitPrefix(q.prefix)
+	if err != nil {
+		return nil, err
+	}
+	folder, err := s.findFolder(ctx, ref.Account, ref.FolderID, dirs)
+	if errors.Is(err, store.ErrNotFound) {
+		return &ListResult{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	res := &ListResult{}
+	if err := s.walk(ctx, q.state(ref.Account, namePrefix, maxKeys, res), folder, keyBase(dirPrefix(q.prefix))); err != nil && !errors.Is(err, errListStop) {
+		return nil, err
+	}
+	return res, nil
+}
+
+// listPool lists each account's pool folder, merges them and pages the
+// merged result.
+func (s *Service) listPool(ctx context.Context, q listQuery, maxKeys int) (*ListResult, error) {
 	accounts, err := s.Store.ListAccounts(ctx)
 	if err != nil {
 		return nil, err
 	}
-	dirs, namePrefix, err := splitPrefix(prefix)
+	dirs, namePrefix, err := splitPrefix(q.prefix)
 	if err != nil {
 		return nil, err
 	}
 	merged := &ListResult{}
 	seenKeys := map[string]bool{}
 	for _, acct := range accounts {
-		ns, err := s.ensureNamespace(ctx, acct)
+		part, err := s.listPoolAccount(ctx, acct, dirs, namePrefix, q)
 		if err != nil {
-			continue
-		}
-		folder, err := s.findFolder(ctx, acct, ns, []string{s.poolName(ctx)})
-		if err != nil {
-			continue
-		}
-		folder, err = s.findFolder(ctx, acct, folder, dirs)
-		if err != nil {
-			continue
-		}
-		part := &ListResult{}
-		state := &listState{
-			prefix: prefix, namePrefix: namePrefix, delimiter: delimiter,
-			after: after, limit: 0, res: part, seen: map[string]bool{},
-			account: acct, includeDocs: includeDocs,
-		}
-		if err := s.walk(ctx, state, folder, keyBase(dirPrefix(prefix))); err != nil && !errors.Is(err, errListStop) {
 			return nil, err
 		}
-		merged.Scanned += part.Scanned
-		for _, o := range part.Objects {
-			if !seenKeys[o.Key] {
-				seenKeys[o.Key] = true
-				merged.Objects = append(merged.Objects, o)
-			}
-		}
-		for _, p := range part.CommonPrefixes {
-			if !seenKeys[p] {
-				seenKeys[p] = true
-				merged.CommonPrefixes = append(merged.CommonPrefixes, p)
-			}
+		if part != nil {
+			mergeUnique(merged, part, seenKeys)
 		}
 	}
-	// Objects that already have a pool index entry win over duplicates.
-	for i, o := range merged.Objects {
-		if p, err := s.Store.GetPoolObject(ctx, o.Key); err == nil && p.AccountID != o.AccountID {
-			acct := accountByID(accounts, p.AccountID)
-			if acct != nil {
-				if f, err := s.Google.GetFile(ctx, acct, p.FileID); err == nil {
-					merged.Objects[i] = objectFromFile(o.Key, acct, f)
-				}
-			}
-		}
-	}
-	sort.Slice(merged.Objects, func(i, j int) bool { return merged.Objects[i].Key < merged.Objects[j].Key })
-	sort.Strings(merged.CommonPrefixes)
+	s.preferIndexedCopies(ctx, accounts, merged.Objects)
+	out := pageListing(merged.Objects, merged.CommonPrefixes, q.after, q.delimiter, maxKeys)
+	out.Scanned = merged.Scanned
+	return out, nil
+}
 
-	// S3 orders objects and common prefixes together by key. Emitting all
-	// prefixes first would lose keys such as "a.txt" when a page ends at "a/".
+// listPoolAccount walks one account's pool folder for the prefix. It returns
+// nil when the account has no such folder; an account whose namespace or
+// pool folder cannot be resolved is logged and skipped so the other
+// accounts still list.
+func (s *Service) listPoolAccount(ctx context.Context, acct *store.Account, dirs []string, namePrefix string, q listQuery) (*ListResult, error) {
+	folder, err := s.poolPrefixFolder(ctx, acct, dirs)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		s.Log.Warn("skip account in pool listing", "account", acct.ID, "err", err)
+		return nil, nil
+	}
+	part := &ListResult{}
+	if err := s.walk(ctx, q.state(acct, namePrefix, 0, part), folder, keyBase(dirPrefix(q.prefix))); err != nil && !errors.Is(err, errListStop) {
+		return nil, err
+	}
+	return part, nil
+}
+
+func (s *Service) poolPrefixFolder(ctx context.Context, acct *store.Account, dirs []string) (string, error) {
+	ns, err := s.ensureNamespace(ctx, acct)
+	if err != nil {
+		return "", err
+	}
+	folder, err := s.findFolder(ctx, acct, ns, []string{s.poolName(ctx)})
+	if err != nil {
+		return "", err
+	}
+	return s.findFolder(ctx, acct, folder, dirs)
+}
+
+// mergeUnique adds part's objects and prefixes that no earlier account
+// listed.
+func mergeUnique(merged, part *ListResult, seen map[string]bool) {
+	merged.Scanned += part.Scanned
+	for _, o := range part.Objects {
+		if !seen[o.Key] {
+			seen[o.Key] = true
+			merged.Objects = append(merged.Objects, o)
+		}
+	}
+	for _, p := range part.CommonPrefixes {
+		if !seen[p] {
+			seen[p] = true
+			merged.CommonPrefixes = append(merged.CommonPrefixes, p)
+		}
+	}
+}
+
+// preferIndexedCopies replaces an object with the copy the pool index points
+// to when duplicates exist on several accounts.
+func (s *Service) preferIndexedCopies(ctx context.Context, accounts []*store.Account, objects []Object) {
+	for i, o := range objects {
+		p, err := s.Store.GetPoolObject(ctx, o.Key)
+		if err != nil || p.AccountID == o.AccountID {
+			continue
+		}
+		acct := accountByID(accounts, p.AccountID)
+		if acct == nil {
+			continue
+		}
+		if f, err := s.Google.GetFile(ctx, acct, p.FileID); err == nil {
+			objects[i] = objectFromFile(o.Key, acct, f)
+		}
+	}
+}
+
+// pageListing returns one page of up to maxKeys entries after the marker.
+// S3 orders objects and common prefixes together by key; emitting all
+// prefixes first would lose keys such as "a.txt" when a page ends at "a/".
+func pageListing(objects []Object, prefixes []string, after, delimiter string, maxKeys int) *ListResult {
 	type listItem struct {
 		key    string
 		prefix bool
 		obj    Object
 	}
-	items := make([]listItem, 0, len(merged.Objects)+len(merged.CommonPrefixes))
-	for _, o := range merged.Objects {
+	items := make([]listItem, 0, len(objects)+len(prefixes))
+	for _, o := range objects {
 		items = append(items, listItem{key: o.Key, obj: o})
 	}
-	for _, p := range merged.CommonPrefixes {
+	for _, p := range prefixes {
 		items = append(items, listItem{key: p, prefix: true})
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].key < items[j].key })
+	sort.SliceStable(items, func(i, j int) bool { return items[i].key < items[j].key })
 
-	out := &ListResult{Scanned: merged.Scanned}
-	count := 0
+	out := &ListResult{}
 	for _, item := range items {
 		if !pastAfter(item.key, after, delimiter) {
 			continue
 		}
-		if count >= maxKeys {
+		if len(out.Objects)+len(out.CommonPrefixes) >= maxKeys {
 			out.IsTruncated = true
 			break
 		}
@@ -834,12 +894,8 @@ func (s *Service) list(ctx context.Context, bucketName, prefix, delimiter string
 			out.Objects = append(out.Objects, item.obj)
 		}
 		out.NextAfter = item.key
-		count++
 	}
-	for i := range out.Objects {
-		s.enrichObject(ctx, bucketName, &out.Objects[i])
-	}
-	return out, nil
+	return out
 }
 
 // Search walks a bucket recursively and returns keys containing query. It is
@@ -889,39 +945,29 @@ func (s *Service) listWithCustomDelimiter(ctx context.Context, bucketName, prefi
 		}
 		cursor = page.NextAfter
 	}
-	sort.Slice(objects, func(i, j int) bool { return objects[i].Key < objects[j].Key })
-	out := &ListResult{}
-	seenPrefix := map[string]bool{}
-	count := 0
+	direct, prefixes := groupByDelimiter(objects, prefix, delimiter)
+	return pageListing(direct, prefixes, after, delimiter, maxKeys), nil
+}
+
+// groupByDelimiter splits objects into those listed directly and the
+// distinct common prefixes that keys containing the delimiter roll up to.
+func groupByDelimiter(objects []Object, prefix, delimiter string) ([]Object, []string) {
+	var direct []Object
+	var prefixes []string
+	seen := map[string]bool{}
 	for _, obj := range objects {
 		rest := strings.TrimPrefix(obj.Key, prefix)
-		if idx := strings.Index(rest, delimiter); idx >= 0 {
-			cp := prefix + rest[:idx+len(delimiter)]
-			if seenPrefix[cp] || !pastAfter(cp, after, delimiter) {
-				continue
-			}
-			if count >= maxKeys {
-				out.IsTruncated = true
-				break
-			}
-			seenPrefix[cp] = true
-			out.CommonPrefixes = append(out.CommonPrefixes, cp)
-			out.NextAfter = cp
-			count++
+		idx := strings.Index(rest, delimiter)
+		if idx < 0 {
+			direct = append(direct, obj)
 			continue
 		}
-		if !pastAfter(obj.Key, after, delimiter) {
-			continue
+		if cp := prefix + rest[:idx+len(delimiter)]; !seen[cp] {
+			seen[cp] = true
+			prefixes = append(prefixes, cp)
 		}
-		if count >= maxKeys {
-			out.IsTruncated = true
-			break
-		}
-		out.Objects = append(out.Objects, obj)
-		out.NextAfter = obj.Key
-		count++
 	}
-	return out, nil
+	return direct, prefixes
 }
 
 func accountByID(accounts []*store.Account, id string) *store.Account {
