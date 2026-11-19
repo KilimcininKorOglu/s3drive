@@ -3,6 +3,7 @@
 package google
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -193,64 +194,106 @@ func (c *Client) do(ctx context.Context, acct *store.Account, method, url string
 		}
 		bodyBytes = b
 	}
-	retryable := method == http.MethodGet || method == http.MethodHead || method == http.MethodDelete
-
+	rq := &apiRequest{
+		acct: acct, method: method, url: url, body: bodyBytes, headers: headers,
+		// Only idempotent methods are retried after a transport error, 429 or
+		// 5xx; POST/PATCH must never be sent twice.
+		retryable: method == http.MethodGet || method == http.MethodHead || method == http.MethodDelete,
+	}
 	var lastErr error
-	refreshed := false
 	for attempt := range 6 {
-		token, err := c.AccessToken(ctx, acct)
-		if err != nil {
-			return nil, err
+		o := c.attempt(ctx, rq, attempt)
+		if !o.retry {
+			return o.resp, o.err
 		}
-		var reader io.Reader
-		if bodyBytes != nil {
-			reader = strings.NewReader(string(bodyBytes))
+		if o.err != nil {
+			lastErr = o.err
 		}
-		req, err := http.NewRequestWithContext(ctx, method, url, reader)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		for k, v := range headers {
-			req.Header.Set(k, v)
-		}
-		resp, err := c.HTTP.Do(req)
-		if err != nil {
-			lastErr = err
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if !retryable {
-				return nil, err
-			}
-			sleepBackoff(ctx, attempt)
-			continue
-		}
-		if resp.StatusCode == http.StatusUnauthorized && !refreshed {
-			_ = resp.Body.Close() // discarded 401 response, retried after refresh
-			refreshed = true
-			if _, err := c.ForceRefresh(ctx, acct); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			lastErr = readAPIError(resp)
-			if retryable && attempt < 5 {
-				sleepBackoff(ctx, attempt)
-				continue
-			}
-			return nil, lastErr
-		}
-		if resp.StatusCode >= 400 {
-			return nil, readAPIError(resp)
-		}
-		return resp, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("request failed")
 	}
 	return nil, lastErr
+}
+
+// apiRequest is one Drive API call, replayable across attempts.
+type apiRequest struct {
+	acct      *store.Account
+	method    string
+	url       string
+	body      []byte
+	headers   map[string]string
+	retryable bool
+	refreshed bool // the token was already force-refreshed after a 401
+}
+
+// outcome is the result of one attempt. With retry set, err is the error to
+// report if no attempt is left (nil after a token refresh); any backoff has
+// already been applied.
+type outcome struct {
+	resp  *http.Response
+	err   error
+	retry bool
+}
+
+func (c *Client) attempt(ctx context.Context, rq *apiRequest, n int) outcome {
+	token, err := c.AccessToken(ctx, rq.acct)
+	if err != nil {
+		return outcome{err: err}
+	}
+	var reader io.Reader
+	if rq.body != nil {
+		reader = bytes.NewReader(rq.body)
+	}
+	req, err := http.NewRequestWithContext(ctx, rq.method, rq.url, reader)
+	if err != nil {
+		return outcome{err: err}
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	for k, v := range rq.headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return transportFailure(ctx, rq, err, n)
+	}
+	return c.classify(ctx, rq, resp, n)
+}
+
+func transportFailure(ctx context.Context, rq *apiRequest, err error, n int) outcome {
+	if ctx.Err() != nil {
+		return outcome{err: ctx.Err()}
+	}
+	if !rq.retryable {
+		return outcome{err: err}
+	}
+	sleepBackoff(ctx, n)
+	return outcome{err: err, retry: true}
+}
+
+// classify maps a response: one forced token refresh after a 401, backoff
+// on 429/5xx for retryable methods, and API errors for other 4xx.
+func (c *Client) classify(ctx context.Context, rq *apiRequest, resp *http.Response, n int) outcome {
+	if resp.StatusCode == http.StatusUnauthorized && !rq.refreshed {
+		_ = resp.Body.Close() // discarded 401 response, retried after refresh
+		rq.refreshed = true
+		if _, err := c.ForceRefresh(ctx, rq.acct); err != nil {
+			return outcome{err: err}
+		}
+		return outcome{retry: true}
+	}
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		apiErr := readAPIError(resp)
+		if rq.retryable && n < 5 {
+			sleepBackoff(ctx, n)
+			return outcome{err: apiErr, retry: true}
+		}
+		return outcome{err: apiErr}
+	}
+	if resp.StatusCode >= 400 {
+		return outcome{err: readAPIError(resp)}
+	}
+	return outcome{resp: resp}
 }
 
 func readAPIError(resp *http.Response) error {
