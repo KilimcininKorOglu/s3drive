@@ -480,38 +480,15 @@ func setListPaging(out *listBucketResult, p listParams, res *drive.ListResult, q
 
 func (s *Server) putObject(o *opCtx) {
 	if strings.HasSuffix(o.key, "/") {
-		if o.r.ContentLength > 0 {
-			writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "folder markers must be empty", http.StatusBadRequest)
-			return
-		}
-		if err := s.Svc.CreateFolder(o.r.Context(), o.bucket, o.key); err != nil {
-			s.fail(o, err)
-			return
-		}
-		o.w.Header().Set("ETag", quoteETag("d41d8cd98f00b204e9800998ecf8427e"))
-		o.w.WriteHeader(http.StatusOK)
+		s.putFolderMarker(o)
 		return
 	}
-	expectedMD5, aerr := contentMD5(o.r)
-	if aerr != nil {
-		writeS3Error(o.w, o.r, o.reqID, aerr.Code, aerr.Message, aerr.Status)
+	expected, ok := s.expectedPutChecksums(o)
+	if !ok || !s.checkWriteConditions(o) {
 		return
 	}
-	expected := expectedChecksums(o.r)
-	if expectedMD5 != "" {
-		expected["md5"] = expectedMD5
-	}
-	if !s.checkWriteConditions(o) {
-		return
-	}
-	contentType := o.r.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	storageClass := strings.ToUpper(strings.TrimSpace(o.r.Header.Get("x-amz-storage-class")))
-	if storageClass == "" {
-		storageClass = "STANDARD"
-	}
+	contentType := cmp.Or(o.r.Header.Get("Content-Type"), "application/octet-stream")
+	storageClass := cmp.Or(strings.ToUpper(strings.TrimSpace(o.r.Header.Get("x-amz-storage-class"))), "STANDARD")
 	res, err := s.Svc.PutChecked(o.r.Context(), o.bucket, o.key, contentType, o.r.Body, expected)
 	if err != nil {
 		s.fail(o, err)
@@ -533,6 +510,35 @@ func (s *Server) putObject(o *opCtx) {
 }
 
 // checkWriteConditions implements If-None-Match: * and If-Match for writes.
+// putFolderMarker stores an empty "key/" object as a Drive folder.
+func (s *Server) putFolderMarker(o *opCtx) {
+	if o.r.ContentLength > 0 {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "folder markers must be empty", http.StatusBadRequest)
+		return
+	}
+	if err := s.Svc.CreateFolder(o.r.Context(), o.bucket, o.key); err != nil {
+		s.fail(o, err)
+		return
+	}
+	o.w.Header().Set("ETag", quoteETag("d41d8cd98f00b204e9800998ecf8427e"))
+	o.w.WriteHeader(http.StatusOK)
+}
+
+// expectedPutChecksums collects the checksums the client asked us to verify,
+// including Content-MD5. It writes the error response itself.
+func (s *Server) expectedPutChecksums(o *opCtx) (map[string]string, bool) {
+	expectedMD5, aerr := contentMD5(o.r)
+	if aerr != nil {
+		writeS3Error(o.w, o.r, o.reqID, aerr.Code, aerr.Message, aerr.Status)
+		return nil, false
+	}
+	expected := expectedChecksums(o.r)
+	if expectedMD5 != "" {
+		expected["md5"] = expectedMD5
+	}
+	return expected, true
+}
+
 func (s *Server) checkWriteConditions(o *opCtx) bool {
 	ifNone := o.r.Header.Get("If-None-Match")
 	ifMatch := o.r.Header.Get("If-Match")
@@ -544,16 +550,27 @@ func (s *Server) checkWriteConditions(o *opCtx) bool {
 		s.fail(o, err)
 		return false
 	}
-	exists := err == nil
-	if ifNone == "*" && exists {
-		writeS3Error(o.w, o.r, o.reqID, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", http.StatusPreconditionFailed)
-		return false
+	etag := ""
+	if err == nil {
+		etag = obj.ETag
 	}
-	if ifMatch != "" && (!exists || (ifMatch != "*" && !etagMatches(ifMatch, obj.ETag))) {
+	if !writePreconditionsHold(ifNone, ifMatch, err == nil, etag) {
 		writeS3Error(o.w, o.r, o.reqID, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", http.StatusPreconditionFailed)
 		return false
 	}
 	return true
+}
+
+// writePreconditionsHold applies If-None-Match: * (create only) and If-Match
+// (the existing ETag, or * for any existing object).
+func writePreconditionsHold(ifNone, ifMatch string, exists bool, etag string) bool {
+	if ifNone == "*" && exists {
+		return false
+	}
+	if ifMatch == "" {
+		return true
+	}
+	return exists && (ifMatch == "*" || etagMatches(ifMatch, etag))
 }
 
 func expectedChecksums(r *http.Request) map[string]string {
@@ -591,23 +608,9 @@ func setChecksumResponse(o *opCtx, checksum string) {
 }
 
 func (s *Server) getObject(o *opCtx) {
-	rangeHeader := o.r.Header.Get("Range")
-	var total int64
-	var modified time.Time
-	if rangeHeader != "" {
-		stat, _, err := s.Svc.Stat(o.r.Context(), o.bucket, o.key)
-		if err != nil {
-			s.fail(o, err)
-			return
-		}
-		total, modified = stat.Size, stat.Modified
-		if ifRange := o.r.Header.Get("If-Range"); ifRange != "" && !ifRangeMatches(ifRange, stat.ETag, modified) {
-			rangeHeader = ""
-		} else if _, _, _, ok := parseByteRange(rangeHeader, total); !ok {
-			o.w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(total, 10))
-			writeS3Error(o.w, o.r, o.reqID, "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
+	rangeHeader, ok := s.resolveRange(o)
+	if !ok {
+		return
 	}
 	obj, err := s.Svc.Get(o.r.Context(), o.bucket, o.key, rangeHeader)
 	if err != nil {
@@ -626,18 +629,52 @@ func (s *Server) getObject(o *opCtx) {
 	if obj.ContentRange != "" {
 		status = http.StatusPartialContent
 	}
-	if v := o.r.URL.Query().Get("response-content-type"); v != "" {
-		o.w.Header().Set("Content-Type", v)
-	}
-	if v := o.r.URL.Query().Get("response-content-disposition"); v != "" {
-		o.w.Header().Set("Content-Disposition", v)
-	}
-	if v := o.r.URL.Query().Get("response-cache-control"); v != "" {
-		o.w.Header().Set("Cache-Control", v)
-	}
+	applyResponseOverrides(o)
 	o.w.WriteHeader(status)
-	n, _ := io.Copy(o.w, obj.Body)
+	n, err := io.Copy(o.w, obj.Body)
 	o.bytes = n
+	if err != nil {
+		// Headers are sent; the client sees a short body. Usually a disconnect.
+		s.Log.Debug("stream object body", "bucket", o.bucket, "key", o.key, "bytes", n, "err", err)
+	}
+}
+
+// resolveRange validates the Range header against the object size. It
+// drops the range when If-Range does not match and writes 416 itself.
+func (s *Server) resolveRange(o *opCtx) (string, bool) {
+	rangeHeader := o.r.Header.Get("Range")
+	if rangeHeader == "" {
+		return "", true
+	}
+	stat, _, err := s.Svc.Stat(o.r.Context(), o.bucket, o.key)
+	if err != nil {
+		s.fail(o, err)
+		return "", false
+	}
+	if ifRange := o.r.Header.Get("If-Range"); ifRange != "" && !ifRangeMatches(ifRange, stat.ETag, stat.Modified) {
+		return "", true
+	}
+	if _, _, _, ok := parseByteRange(rangeHeader, stat.Size); !ok {
+		o.w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(stat.Size, 10))
+		writeS3Error(o.w, o.r, o.reqID, "InvalidRange", "The requested range is not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+		return "", false
+	}
+	return rangeHeader, true
+}
+
+// applyResponseOverrides honors the response-* query overrides S3 allows
+// on GET (typically from presigned URLs).
+func applyResponseOverrides(o *opCtx) {
+	q := o.r.URL.Query()
+	for param, header := range map[string]string{
+		"response-content-type":        "Content-Type",
+		"response-content-disposition": "Content-Disposition",
+		"response-cache-control":       "Cache-Control",
+	} {
+		if v := q.Get(param); v != "" {
+			o.w.Header().Set(header, v)
+		}
+	}
 }
 
 func (s *Server) headObject(o *opCtx) {
