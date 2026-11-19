@@ -822,6 +822,52 @@ func (s *Service) CreateFolder(ctx context.Context, bucketName, key string) erro
 
 // pickAccount chooses an account for writes. preferred wins when set;
 // otherwise the account with the most free space is used.
+func accountNamed(accounts []*store.Account, preferred string) (*store.Account, error) {
+	for _, a := range accounts {
+		if a.ID == preferred || a.Email == preferred || a.Name == preferred {
+			return a, nil
+		}
+	}
+	return nil, newError("InvalidArgument", "unknown account %q", preferred)
+}
+
+// accountFree returns the account's free space after reservations. ok is
+// false when the account cannot take need bytes: its daily upload budget
+// or Drive quota would be exceeded, or either could not be read.
+func (s *Service) accountFree(ctx context.Context, a *store.Account, need int64) (int64, bool) {
+	if !s.withinDailyBudget(ctx, a, need) {
+		return 0, false
+	}
+	about, err := s.AccountQuota(ctx, a, false)
+	if err != nil {
+		return 0, false
+	}
+	free := int64(1 << 60) // unlimited / unknown
+	if about.Limit > 0 {
+		free = about.Limit - about.Usage
+	}
+	free -= s.reservedFor(a.ID)
+	if need > 0 && about.Limit > 0 && free < need {
+		return 0, false
+	}
+	return free, true
+}
+
+// withinDailyBudget reports whether need more bytes fit the account's daily
+// upload limit. An unreadable usage counter counts as over budget, so a
+// store error cannot lift the limit.
+func (s *Service) withinDailyBudget(ctx context.Context, a *store.Account, need int64) bool {
+	if s.DailyUploadBytes <= 0 {
+		return true
+	}
+	used, err := s.Store.UploadUsageToday(ctx, a.ID)
+	if err != nil {
+		s.Log.Warn("read daily upload usage", "account", a.ID, "err", err)
+		return false
+	}
+	return used+s.reservedFor(a.ID)+need <= s.DailyUploadBytes
+}
+
 func (s *Service) pickAccount(ctx context.Context, preferred string, need int64) (*store.Account, error) {
 	accounts, err := s.Store.ListAccounts(ctx)
 	if err != nil {
@@ -831,35 +877,12 @@ func (s *Service) pickAccount(ctx context.Context, preferred string, need int64)
 		return nil, newError("AccessDenied", "no Google account is connected")
 	}
 	if preferred != "" {
-		for _, a := range accounts {
-			if a.ID == preferred || a.Email == preferred || a.Name == preferred {
-				return a, nil
-			}
-		}
-		return nil, newError("InvalidArgument", "unknown account %q", preferred)
+		return accountNamed(accounts, preferred)
 	}
-
 	var best *store.Account
 	var bestFree int64 = -1
 	for _, a := range accounts {
-		if s.DailyUploadBytes > 0 {
-			if used, _ := s.Store.UploadUsageToday(ctx, a.ID); used+s.reservedFor(a.ID)+need > s.DailyUploadBytes {
-				continue
-			}
-		}
-		about, err := s.AccountQuota(ctx, a, false)
-		if err != nil {
-			continue
-		}
-		free := int64(1 << 60) // unlimited / unknown
-		if about.Limit > 0 {
-			free = about.Limit - about.Usage
-		}
-		free -= s.reservedFor(a.ID)
-		if need > 0 && about.Limit > 0 && free < need {
-			continue
-		}
-		if free > bestFree {
+		if free, ok := s.accountFree(ctx, a, need); ok && free > bestFree {
 			best, bestFree = a, free
 		}
 	}
