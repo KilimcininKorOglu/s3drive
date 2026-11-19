@@ -570,7 +570,7 @@ func fileMD5(path string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = f.Close() }() // read-only part file
-	h := md5.New() // #nosec G401 -- S3 part/multipart ETag checksum
+	h := md5.New()                   // #nosec G401 -- S3 part/multipart ETag checksum
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}
