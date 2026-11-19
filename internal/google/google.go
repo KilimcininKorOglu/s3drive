@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -709,9 +710,7 @@ func (c *Client) uploadResumable(ctx context.Context, acct *store.Account, exist
 		}
 		file, retry, err := c.putResumableChunks(ctx, acct, sessionURL, r, size, offset, resume)
 		if err == nil {
-			if err := c.dropResume(ctx, resume); err != nil {
-				return nil, err
-			}
+			c.forgetCompleted(ctx, resume)
 			return file, nil
 		}
 		lastErr = err
@@ -750,9 +749,7 @@ func (c *Client) prepareResume(ctx context.Context, acct *store.Account, resume 
 		return "", 0, nil, err
 	}
 	if file != nil {
-		if err := c.dropResume(ctx, resume); err != nil {
-			return "", 0, nil, err
-		}
+		c.forgetCompleted(ctx, resume)
 		return "", 0, file, nil
 	}
 	return d.SessionURL, offset, nil, nil
@@ -830,6 +827,17 @@ func parseRangeOffset(header string) int64 {
 
 // dropResume deletes a stale resumable session so the next attempt starts a
 // new one. A failure is returned: a kept stale session would be reused.
+// forgetCompleted deletes the session of an upload that Drive has already
+// stored. The caller must still record the new file (metadata, pool index),
+// so a failure is logged instead of turning the stored upload into an error.
+// A kept session carries the content hash in its identity and resolves to the
+// same completed file if it is ever reused.
+func (c *Client) forgetCompleted(ctx context.Context, resume *UploadResume) {
+	if err := c.dropResume(ctx, resume); err != nil {
+		slog.Warn("drop completed upload session", "bucket", resume.Bucket, "key", resume.Key, "err", err)
+	}
+}
+
 func (c *Client) dropResume(ctx context.Context, resume *UploadResume) error {
 	if err := c.Store.DeleteDriveSession(ctx, resume.Bucket, resume.Key); err != nil {
 		return fmt.Errorf("drop stale upload session: %w", err)
