@@ -1037,12 +1037,32 @@ func (st *listState) addPrefix(p string) error {
 // "a.txt" sorts before the common prefix "a/"). Children are collected and
 // sorted before recursion so pagination cannot skip an interleaved key.
 func (s *Service) walk(ctx context.Context, st *listState, folderID, keyBase string) error {
+	files, err := s.sortedChildren(ctx, st, folderID)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		name := decodeSegment(f.Name)
+		if f.IsFolder {
+			err = s.walkFolder(ctx, st, &f, name, keyBase)
+		} else {
+			err = st.addFile(&f, name, keyBase)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sortedChildren reads every page of a folder's children in listing order.
+func (s *Service) sortedChildren(ctx context.Context, st *listState, folderID string) ([]google.File, error) {
 	var files []google.File
 	pageToken := ""
 	for {
 		page, next, err := s.Google.ListChildren(ctx, st.account, folderID, pageToken)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		st.res.Scanned += len(page)
 		files = append(files, page...)
@@ -1054,45 +1074,39 @@ func (s *Service) walk(ctx context.Context, st *listState, folderID, keyBase str
 	sort.SliceStable(files, func(i, j int) bool {
 		return listSortName(&files[i]) < listSortName(&files[j])
 	})
-	for _, f := range files {
-		name := decodeSegment(f.Name)
-		if f.IsFolder {
-			if st.delimiter != "" {
-				if !strings.HasPrefix(name, st.namePrefix) {
-					continue
-				}
-				rel := name[len(st.namePrefix):] + "/"
-				if idx := strings.Index(rel, st.delimiter); idx >= 0 {
-					cp := st.prefix + rel[:idx+len(st.delimiter)]
-					if err := st.addPrefix(cp); err != nil {
-						return err
-					}
-				}
-				continue
-			}
-			if st.namePrefix == "" || strings.HasPrefix(name, st.namePrefix) {
-				oldPrefix := st.namePrefix
-				st.namePrefix = ""
-				err := s.walk(ctx, st, f.ID, keyBase+name+"/")
-				st.namePrefix = oldPrefix
-				if err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		if !strings.HasPrefix(name, st.namePrefix) {
-			continue
-		}
-		if f.MimeType == google.FolderMime || (IsNativeDoc(f.MimeType) && !st.includeDocs) {
-			continue
-		}
-		o := objectFromFile(keyBase+name, st.account, &f)
-		if err := st.addObject(o); err != nil {
-			return err
-		}
+	return files, nil
+}
+
+// walkFolder rolls a matching subfolder up into a common prefix when a
+// delimiter is set, or descends into it otherwise.
+func (s *Service) walkFolder(ctx context.Context, st *listState, f *google.File, name, keyBase string) error {
+	if !strings.HasPrefix(name, st.namePrefix) {
+		return nil
 	}
-	return nil
+	if st.delimiter != "" {
+		rel := name[len(st.namePrefix):] + "/"
+		if idx := strings.Index(rel, st.delimiter); idx >= 0 {
+			return st.addPrefix(st.prefix + rel[:idx+len(st.delimiter)])
+		}
+		return nil
+	}
+	oldPrefix := st.namePrefix
+	st.namePrefix = ""
+	err := s.walk(ctx, st, f.ID, keyBase+name+"/")
+	st.namePrefix = oldPrefix
+	return err
+}
+
+// addFile lists a file whose name matches; native Google Docs are skipped
+// unless the listing includes them.
+func (st *listState) addFile(f *google.File, name, keyBase string) error {
+	if !strings.HasPrefix(name, st.namePrefix) {
+		return nil
+	}
+	if f.MimeType == google.FolderMime || (IsNativeDoc(f.MimeType) && !st.includeDocs) {
+		return nil
+	}
+	return st.addObject(objectFromFile(keyBase+name, st.account, f))
 }
 
 func listSortName(f *google.File) string {
