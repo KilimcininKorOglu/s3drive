@@ -1,0 +1,13 @@
+version: "2"
+
+linters:
+  enable:
+    - gocyclo
+  settings:
+    gocyclo:
+      # Every function, tests included, must stay at cyclomatic complexity 10
+      # or less.
+      min-complexity: 10
+  exclusions:
+    paths:
+      - helper-projects

@@ -2,7 +2,9 @@ BIN := bin/s3drive
 VERSION ?= 0.1.0
 LDFLAGS := -s -w -X s3drive/internal/config.Version=$(VERSION)
 
-.PHONY: all build run dev test vet fmt tidy docker clean
+GOLANGCI_LINT := github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
+
+.PHONY: all build run dev test vet lint fmt tidy docker clean
 
 all: build
 
@@ -21,6 +23,9 @@ test:
 
 vet:
 	go vet ./...
+
+lint:
+	go run $(GOLANGCI_LINT) run ./...
 
 fmt:
 	gofmt -w cmd internal web/embed.go

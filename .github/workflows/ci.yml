@@ -23,6 +23,10 @@ jobs:
           if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
       - name: vet
         run: go vet ./...
+      - name: lint
+        # Built from source with the go.mod toolchain; .golangci.yml holds the
+        # complexity limit of 10.
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...
       - name: test
         run: go test ./...
       - name: build
