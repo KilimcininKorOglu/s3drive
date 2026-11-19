@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"cmp"
 	"crypto/md5" // #nosec G501 -- S3 ETag checksum, not a security primitive
 	"encoding/base64"
 	"encoding/hex"
@@ -354,79 +355,102 @@ func (s *Server) listParts(o *opCtx) {
 		s.noSuchUpload(o)
 		return
 	}
+	q := o.r.URL.Query()
+	maxParts, ok := queryCount(q.Get("max-parts"), 1000)
+	if !ok {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid max-parts", http.StatusBadRequest)
+		return
+	}
+	marker, ok := queryCount(q.Get("part-number-marker"), 0)
+	if !ok {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid part-number-marker", http.StatusBadRequest)
+		return
+	}
 	dir := s.uploadDir(uploadID)
-	entries, _ := os.ReadDir(dir)
-	type part struct {
-		n    int
-		size int64
-		mod  time.Time
-	}
-	var parts []part
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		n, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		parts = append(parts, part{n: n, size: info.Size(), mod: info.ModTime()})
-	}
-	sort.Slice(parts, func(i, j int) bool { return parts[i].n < parts[j].n })
-	maxParts := 1000
-	if v := o.r.URL.Query().Get("max-parts"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid max-parts", http.StatusBadRequest)
-			return
-		}
-		maxParts = n
-	}
-	marker := 0
-	if v := o.r.URL.Query().Get("part-number-marker"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid part-number-marker", http.StatusBadRequest)
-			return
-		}
-		marker = n
-	}
-	storageClass := upload.StorageClass
-	if storageClass == "" {
-		storageClass = "STANDARD"
+	parts, err := stagedParts(dir)
+	if err != nil {
+		s.fail(o, fmt.Errorf("list staged parts: %w", err))
+		return
 	}
 	out := listPartsResult{
 		Xmlns: xmlNS, Bucket: o.bucket, Key: o.key, UploadID: upload.ID,
 		Initiator:        owner{ID: "s3drive", DisplayName: "s3drive"},
 		Owner:            owner{ID: "s3drive", DisplayName: "s3drive"},
-		StorageClass:     storageClass,
+		StorageClass:     cmp.Or(upload.StorageClass, "STANDARD"),
 		PartNumberMarker: marker,
 		MaxParts:         maxParts,
 	}
+	if err := fillPartsPage(&out, dir, parts); err != nil {
+		s.fail(o, err)
+		return
+	}
+	writeXML(o.w, http.StatusOK, out)
+}
+
+// queryCount parses a non-negative count query value; empty means def.
+func queryCount(v string, def int) (int, bool) {
+	if v == "" {
+		return def, true
+	}
+	n, err := strconv.Atoi(v)
+	return n, err == nil && n >= 0
+}
+
+type stagedPart struct {
+	n    int
+	size int64
+	mod  time.Time
+}
+
+// stagedParts lists the committed part files of an upload by part number.
+// A missing directory means no part was uploaded yet.
+func stagedParts(dir string) ([]stagedPart, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var parts []stagedPart
+	for _, e := range entries {
+		n, err := strconv.Atoi(e.Name())
+		if e.IsDir() || err != nil {
+			continue // temp files and other entries are not parts
+		}
+		info, err := e.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // replaced or removed meanwhile
+		}
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, stagedPart{n: n, size: info.Size(), mod: info.ModTime()})
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i].n < parts[j].n })
+	return parts, nil
+}
+
+// fillPartsPage adds the parts after PartNumberMarker, up to MaxParts.
+func fillPartsPage(out *listPartsResult, dir string, parts []stagedPart) error {
 	for _, p := range parts {
-		if p.n <= marker {
+		if p.n <= out.PartNumberMarker {
 			continue
 		}
-		if maxParts == 0 || len(out.Parts) >= maxParts {
+		if out.MaxParts == 0 || len(out.Parts) >= out.MaxParts {
 			out.IsTruncated = true
-			break
+			return nil
 		}
-		path := filepath.Join(dir, strconv.Itoa(p.n))
-		sum, err := fileMD5(path)
+		sum, err := fileMD5(filepath.Join(dir, strconv.Itoa(p.n)))
 		if err != nil {
-			s.fail(o, fmt.Errorf("hash part %d: %w", p.n, err))
-			return
+			return fmt.Errorf("hash part %d: %w", p.n, err)
 		}
 		out.Parts = append(out.Parts, partEntry{
 			PartNumber: p.n, LastModified: xmlTime(p.mod), ETag: quoteETag(sum), Size: p.size,
 		})
 		out.NextPartNumberMarker = p.n
 	}
-	writeXML(o.w, http.StatusOK, out)
+	return nil
 }
 
 func (s *Server) listMultipartUploads(o *opCtx) {
@@ -436,23 +460,19 @@ func (s *Server) listMultipartUploads(o *opCtx) {
 		s.fail(o, err)
 		return
 	}
-	maxUploads := 1000
-	if v := q.Get("max-uploads"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid max-uploads", http.StatusBadRequest)
-			return
-		}
-		maxUploads = n
+	maxUploads, ok := queryCount(q.Get("max-uploads"), 1000)
+	if !ok {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid max-uploads", http.StatusBadRequest)
+		return
 	}
-	prefix := q.Get("prefix")
-	delimiter := q.Get("delimiter")
-	keyMarker := q.Get("key-marker")
-	uploadMarker := q.Get("upload-id-marker")
 	encoding := q.Get("encoding-type")
 	if encoding != "" && encoding != "url" {
 		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid encoding-type", http.StatusBadRequest)
 		return
+	}
+	page := uploadPage{
+		prefix: q.Get("prefix"), delimiter: q.Get("delimiter"),
+		keyMarker: q.Get("key-marker"), uploadMarker: q.Get("upload-id-marker"), max: maxUploads,
 	}
 	sort.Slice(uploads, func(i, j int) bool {
 		if uploads[i].Key == uploads[j].Key {
@@ -462,65 +482,93 @@ func (s *Server) listMultipartUploads(o *opCtx) {
 	})
 	out := listMultipartUploadsResult{
 		Xmlns: xmlNS, Bucket: o.bucket, MaxUploads: maxUploads,
-		Prefix: encodeKey(prefix, encoding), Delimiter: encodeKey(delimiter, encoding),
-		KeyMarker: encodeKey(keyMarker, encoding), UploadIDMarker: uploadMarker,
+		Prefix: encodeKey(page.prefix, encoding), Delimiter: encodeKey(page.delimiter, encoding),
+		KeyMarker: encodeKey(page.keyMarker, encoding), UploadIDMarker: page.uploadMarker,
 		EncodingType: encoding,
 	}
+	page.fill(&out, uploads)
+	if encoding == "url" {
+		encodeUploadListing(&out)
+	}
+	writeXML(o.w, http.StatusOK, out)
+}
+
+// uploadPage is one ListMultipartUploads page request.
+type uploadPage struct {
+	prefix, delimiter, keyMarker, uploadMarker string
+	max                                        int
+}
+
+// fill adds uploads (sorted by key, then ID) after the markers, grouping
+// keys that contain the delimiter into common prefixes.
+func (p uploadPage) fill(out *listMultipartUploadsResult, uploads []*store.Upload) {
 	seenPrefix := map[string]bool{}
 	for _, u := range uploads {
-		if prefix != "" && !strings.HasPrefix(u.Key, prefix) {
+		if !p.includes(u) {
 			continue
 		}
-		if keyMarker != "" {
-			if u.Key < keyMarker || (u.Key == keyMarker && (uploadMarker == "" || u.ID <= uploadMarker)) {
-				continue
+		if cp, grouped := p.group(u.Key); grouped {
+			// A marker inside a common-prefix group means that group was
+			// already returned on an earlier page.
+			if cp > p.keyMarker && !seenPrefix[cp] {
+				seenPrefix[cp] = true
+				out.CommonPrefixes = append(out.CommonPrefixes, commonPrefix{Prefix: cp})
 			}
+			continue
 		}
-		if delimiter != "" {
-			rest := strings.TrimPrefix(u.Key, prefix)
-			if i := strings.Index(rest, delimiter); i >= 0 {
-				cp := prefix + rest[:i+len(delimiter)]
-				// A marker inside a common-prefix group means that group was
-				// already returned on an earlier page.
-				if cp <= keyMarker {
-					continue
-				}
-				if !seenPrefix[cp] {
-					seenPrefix[cp] = true
-					out.CommonPrefixes = append(out.CommonPrefixes, commonPrefix{Prefix: cp})
-				}
-				continue
-			}
-		}
-		if maxUploads == 0 || len(out.Uploads) >= maxUploads {
+		if p.max == 0 || len(out.Uploads) >= p.max {
 			out.IsTruncated = true
-			break
-		}
-		storageClass := u.StorageClass
-		if storageClass == "" {
-			storageClass = "STANDARD"
+			return
 		}
 		out.Uploads = append(out.Uploads, multipartEntry{
 			Key: u.Key, UploadID: u.ID,
 			Initiator:    owner{ID: "s3drive", DisplayName: "s3drive"},
 			Owner:        owner{ID: "s3drive", DisplayName: "s3drive"},
-			StorageClass: storageClass, Initiated: xmlTime(u.CreatedAt),
+			StorageClass: cmp.Or(u.StorageClass, "STANDARD"), Initiated: xmlTime(u.CreatedAt),
 		})
 		out.NextKeyMarker = u.Key
 		out.NextUploadIDMarker = u.ID
 	}
-	if encoding == "url" {
-		for i := range out.Uploads {
-			out.Uploads[i].Key = encodeKey(out.Uploads[i].Key, encoding)
-		}
-		for i := range out.CommonPrefixes {
-			out.CommonPrefixes[i].Prefix = encodeKey(out.CommonPrefixes[i].Prefix, encoding)
-		}
-		if out.NextKeyMarker != "" {
-			out.NextKeyMarker = encodeKey(out.NextKeyMarker, encoding)
-		}
+}
+
+// includes applies the prefix filter and skips uploads at or before the
+// key-marker/upload-id-marker position.
+func (p uploadPage) includes(u *store.Upload) bool {
+	if p.prefix != "" && !strings.HasPrefix(u.Key, p.prefix) {
+		return false
 	}
-	writeXML(o.w, http.StatusOK, out)
+	if p.keyMarker == "" {
+		return true
+	}
+	if u.Key != p.keyMarker {
+		return u.Key > p.keyMarker
+	}
+	return p.uploadMarker != "" && u.ID > p.uploadMarker
+}
+
+// group returns the common prefix a key rolls up into under the delimiter.
+func (p uploadPage) group(key string) (string, bool) {
+	if p.delimiter == "" {
+		return "", false
+	}
+	rest := strings.TrimPrefix(key, p.prefix)
+	i := strings.Index(rest, p.delimiter)
+	if i < 0 {
+		return "", false
+	}
+	return p.prefix + rest[:i+len(p.delimiter)], true
+}
+
+func encodeUploadListing(out *listMultipartUploadsResult) {
+	for i := range out.Uploads {
+		out.Uploads[i].Key = encodeKey(out.Uploads[i].Key, "url")
+	}
+	for i := range out.CommonPrefixes {
+		out.CommonPrefixes[i].Prefix = encodeKey(out.CommonPrefixes[i].Prefix, "url")
+	}
+	if out.NextKeyMarker != "" {
+		out.NextKeyMarker = encodeKey(out.NextKeyMarker, "url")
+	}
 }
 
 func (s *Server) noSuchUpload(o *opCtx) {
