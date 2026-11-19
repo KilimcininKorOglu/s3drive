@@ -120,48 +120,63 @@ func (c *Client) ForceRefresh(ctx context.Context, acct *store.Account) (string,
 	return c.refreshLocked(ctx, acct, st)
 }
 
-func (c *Client) refreshLocked(ctx context.Context, acct *store.Account, st *tokenState) (string, error) {
-	if acct.RefreshToken == "" {
-		return "", ErrReauth
-	}
+// postRefresh sends the refresh_token grant with the account's own OAuth
+// client, or the global one, and returns the status and body (max 1 MiB).
+func (c *Client) postRefresh(ctx context.Context, acct *store.Account) (int, []byte, error) {
 	clientID, clientSecret := acct.ClientID, acct.ClientSecret
 	if clientID == "" || clientSecret == "" {
 		var err error
-		clientID, clientSecret, err = c.ClientCredentials(ctx)
-		if err != nil {
-			return "", err
+		if clientID, clientSecret, err = c.ClientCredentials(ctx); err != nil {
+			return 0, nil, err
 		}
 	}
 	form := fmt.Sprintf("client_id=%s&client_secret=%s&refresh_token=%s&grant_type=refresh_token",
 		urlEncode(clientID), urlEncode(clientSecret), urlEncode(acct.RefreshToken))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form))
 	if err != nil {
-		return "", err
+		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", err
+		return 0, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }() // body fully read below
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("read token response: %w", err)
+		return 0, nil, fmt.Errorf("read token response: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		var oe struct {
-			Error            string `json:"error"`
-			ErrorDescription string `json:"error_description"`
-		}
-		_ = json.Unmarshal(body, &oe)
-		if oe.Error == "invalid_grant" || oe.Error == "unauthorized_client" {
-			reauthErr := fmt.Errorf("%w: %s", ErrReauth, oe.ErrorDescription)
-			if err := c.Store.MarkAccountReauth(ctx, acct.ID); err != nil {
-				return "", errors.Join(reauthErr, fmt.Errorf("mark account for re-auth: %w", err))
-			}
-			return "", reauthErr
-		}
-		return "", fmt.Errorf("token refresh failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	return resp.StatusCode, body, nil
+}
+
+// refreshError maps a failed refresh. A revoked grant marks the account for
+// re-authorization and returns ErrReauth.
+func (c *Client) refreshError(ctx context.Context, accountID string, status int, body []byte) error {
+	var oe struct {
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	_ = json.Unmarshal(body, &oe) // a non-JSON body leaves oe empty and is reported verbatim below
+	if oe.Error != "invalid_grant" && oe.Error != "unauthorized_client" {
+		return fmt.Errorf("token refresh failed (%d): %s", status, strings.TrimSpace(string(body)))
+	}
+	reauthErr := fmt.Errorf("%w: %s", ErrReauth, oe.ErrorDescription)
+	if err := c.Store.MarkAccountReauth(ctx, accountID); err != nil {
+		return errors.Join(reauthErr, fmt.Errorf("mark account for re-auth: %w", err))
+	}
+	return reauthErr
+}
+
+func (c *Client) refreshLocked(ctx context.Context, acct *store.Account, st *tokenState) (string, error) {
+	if acct.RefreshToken == "" {
+		return "", ErrReauth
+	}
+	status, body, err := c.postRefresh(ctx, acct)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", c.refreshError(ctx, acct.ID, status, body)
 	}
 	var tok Token
 	if err := json.Unmarshal(body, &tok); err != nil {
