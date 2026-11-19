@@ -841,8 +841,7 @@ func FormatBytes(n int64) string {
 
 // IsNotFound reports whether err is an S3 NoSuchKey/NoSuchBucket error.
 func IsNotFound(err error) bool {
-	var de *Error
-	if errors.As(err, &de) {
+	if de, ok := errors.AsType[*Error](err); ok {
 		return de.Code == "NoSuchKey" || de.Code == "NoSuchBucket"
 	}
 	return false
@@ -850,8 +849,7 @@ func IsNotFound(err error) bool {
 
 // HTTPStatusOf maps a service error to an HTTP status.
 func HTTPStatusOf(err error) int {
-	var de *Error
-	if errors.As(err, &de) {
+	if de, ok := errors.AsType[*Error](err); ok {
 		return de.Status
 	}
 	if errors.Is(err, context.Canceled) {

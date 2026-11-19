@@ -195,7 +195,7 @@ func (c *Client) do(ctx context.Context, acct *store.Account, method, url string
 
 	var lastErr error
 	refreshed := false
-	for attempt := 0; attempt < 6; attempt++ {
+	for attempt := range 6 {
 		token, err := c.AccessToken(ctx, acct)
 		if err != nil {
 			return nil, err
@@ -277,10 +277,7 @@ func readAPIError(resp *http.Response) error {
 }
 
 func sleepBackoff(ctx context.Context, attempt int) {
-	d := time.Duration(1<<uint(attempt)) * 250 * time.Millisecond
-	if d > 8*time.Second {
-		d = 8 * time.Second
-	}
+	d := min(time.Duration(1<<uint(attempt))*250*time.Millisecond, 8*time.Second)
 	select {
 	case <-ctx.Done():
 	case <-time.After(d):
@@ -630,9 +627,15 @@ func (c *Client) uploadMultipart(ctx context.Context, acct *store.Account, exist
 
 	boundary := "s3drive" + store.NewID()
 	var body strings.Builder
-	body.WriteString("--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n")
+	body.WriteString("--")
+	body.WriteString(boundary)
+	body.WriteString("\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n")
 	body.Write(metaJSON)
-	body.WriteString("\r\n--" + boundary + "\r\nContent-Type: " + mime + "\r\n\r\n")
+	body.WriteString("\r\n--")
+	body.WriteString(boundary)
+	body.WriteString("\r\nContent-Type: ")
+	body.WriteString(mime)
+	body.WriteString("\r\n\r\n")
 	prefix := body.String()
 	var content []byte
 	var err error
@@ -672,7 +675,7 @@ const chunkSize = 32 << 20 // multiple of 256 KiB, as Drive requires
 
 func (c *Client) uploadResumable(ctx context.Context, acct *store.Account, existingID, parentID, name, mime string, r io.ReadSeeker, size int64, resume *UploadResume) (*File, error) {
 	var lastErr error
-	for restart := 0; restart < 3; restart++ {
+	for range 3 {
 		sessionURL, offset, done, err := c.prepareResume(ctx, acct, resume)
 		if err != nil {
 			return nil, err
@@ -761,7 +764,7 @@ var errResumeGone = errors.New("resumable session expired")
 // session. Drive answers 308 with a Range header, or 200 with the file when
 // the upload already completed.
 func (c *Client) queryResumable(ctx context.Context, acct *store.Account, sessionURL string, size int64) (int64, *File, error) {
-	for attempt := 0; attempt < 6; attempt++ {
+	for attempt := range 6 {
 		token, err := c.AccessToken(ctx, acct)
 		if err != nil {
 			return 0, nil, err
@@ -884,7 +887,7 @@ func (c *Client) putResumableChunks(ctx context.Context, acct *store.Account, se
 		}
 
 		var lastErr error
-		for attempt := 0; attempt < 6; attempt++ {
+		for attempt := range 6 {
 			token, err := c.AccessToken(ctx, acct)
 			if err != nil {
 				return nil, false, err

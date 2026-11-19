@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -122,8 +123,7 @@ func newError(code, format string, args ...any) *Error {
 
 // CodeOf returns the S3 error code for err, or "InternalError".
 func CodeOf(err error) string {
-	var de *Error
-	if errors.As(err, &de) {
+	if de, ok := errors.AsType[*Error](err); ok {
 		return de.Code
 	}
 	return "InternalError"
@@ -506,8 +506,8 @@ func (s *Service) lockObjects(keys ...string) func() {
 		unlocks = append(unlocks, s.lockFolder("obj:"+key))
 	}
 	return func() {
-		for i := len(unlocks) - 1; i >= 0; i-- {
-			unlocks[i]()
+		for _, unlock := range slices.Backward(unlocks) {
+			unlock()
 		}
 	}
 }
@@ -602,11 +602,11 @@ func splitKey(key string) (dirs []string, name string, err error) {
 	if trimmed == "" {
 		return nil, "", newError("InvalidObjectName", "empty object key")
 	}
-	idx := strings.LastIndex(trimmed, "/")
-	if idx < 0 {
+	before, after, ok := strings.CutLast(trimmed, "/")
+	if !ok {
 		return nil, trimmed, nil
 	}
-	return strings.Split(trimmed[:idx], "/"), trimmed[idx+1:], nil
+	return strings.Split(before, "/"), after, nil
 }
 
 // ValidateKey rejects keys Drive cannot represent safely.
@@ -620,7 +620,7 @@ func ValidateKey(key string) error {
 	if strings.ContainsRune(key, 0) {
 		return newError("InvalidObjectName", "object key contains a NUL byte")
 	}
-	for _, seg := range strings.Split(strings.TrimSuffix(key, "/"), "/") {
+	for seg := range strings.SplitSeq(strings.TrimSuffix(key, "/"), "/") {
 		if len(encodeSegment(seg)) > 255 {
 			return newError("InvalidObjectName", "a path component is too long for Drive's 255-byte limit")
 		}
@@ -1097,15 +1097,15 @@ func splitPrefix(prefix string) (dirs []string, namePrefix string, err error) {
 	if prefix == "" {
 		return nil, "", nil
 	}
-	if strings.HasSuffix(prefix, "/") {
-		dirs = strings.Split(strings.TrimSuffix(prefix, "/"), "/")
+	if before, ok := strings.CutSuffix(prefix, "/"); ok {
+		dirs = strings.Split(before, "/")
 	} else {
-		idx := strings.LastIndex(prefix, "/")
-		if idx < 0 {
+		before, after, ok := strings.CutLast(prefix, "/")
+		if !ok {
 			return nil, prefix, nil
 		}
-		dirs = strings.Split(prefix[:idx], "/")
-		namePrefix = prefix[idx+1:]
+		dirs = strings.Split(before, "/")
+		namePrefix = after
 	}
 	return dirs, namePrefix, nil
 }
@@ -1136,8 +1136,7 @@ func pastAfter(key, after, delimiter string) bool {
 }
 
 func isGoogleNotFound(err error) bool {
-	var apiErr *google.APIError
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[*google.APIError](err); ok {
 		return apiErr.Status == http.StatusNotFound
 	}
 	return errors.Is(err, store.ErrNotFound)

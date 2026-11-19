@@ -531,8 +531,8 @@ func userMetadataJSON(r *http.Request) string {
 	meta := map[string]string{}
 	for k, vs := range r.Header {
 		lk := strings.ToLower(k)
-		if strings.HasPrefix(lk, "x-amz-meta-") {
-			meta[strings.TrimPrefix(lk, "x-amz-meta-")] = strings.Join(vs, ",")
+		if after, ok := strings.CutPrefix(lk, "x-amz-meta-"); ok {
+			meta[after] = strings.Join(vs, ",")
 		}
 	}
 	if len(meta) == 0 {
@@ -543,7 +543,7 @@ func userMetadataJSON(r *http.Request) string {
 }
 
 func setChecksumResponse(o *opCtx, checksum string) {
-	for _, part := range strings.Split(checksum, ";") {
+	for part := range strings.SplitSeq(checksum, ";") {
 		k, v, ok := strings.Cut(part, "=")
 		if ok && v != "" {
 			o.w.Header().Set(k, v)
@@ -705,7 +705,7 @@ func setObjectHeaders(o *opCtx, obj *drive.ObjectReader) {
 	for k, v := range obj.Object.Metadata {
 		h.Set("x-amz-meta-"+k, v)
 	}
-	for _, part := range strings.Split(obj.Object.Checksum, ";") {
+	for part := range strings.SplitSeq(obj.Object.Checksum, ";") {
 		k, v, ok := strings.Cut(part, "=")
 		if ok && v != "" {
 			h.Set(k, v)
@@ -745,7 +745,7 @@ func checkConditions(o *opCtx, obj *drive.ObjectReader) bool {
 }
 
 func etagMatches(header, etag string) bool {
-	for _, candidate := range strings.Split(header, ",") {
+	for candidate := range strings.SplitSeq(header, ",") {
 		candidate = strings.TrimSpace(candidate)
 		candidate = strings.Trim(candidate, `"`)
 		if candidate == etag || candidate == "*" {
@@ -984,12 +984,10 @@ func mapError(err error) (code, message string, status int) {
 	if errors.Is(err, errPayloadHashMismatch) {
 		return "XAmzContentSHA256Mismatch", errPayloadHashMismatch.Error(), http.StatusBadRequest
 	}
-	var de *drive.Error
-	if errors.As(err, &de) {
+	if de, ok := errors.AsType[*drive.Error](err); ok {
 		return de.Code, de.Message, de.Status
 	}
-	var ae *google.APIError
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[*google.APIError](err); ok {
 		switch ae.Status {
 		case http.StatusUnauthorized:
 			return "AccessDenied", "the connected Google account must be reauthorized", http.StatusForbidden
@@ -1148,7 +1146,7 @@ func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request, cfg drive.Set
 	if allowed == "" || allowed == "*" {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 	} else {
-		for _, candidate := range strings.Split(allowed, ",") {
+		for candidate := range strings.SplitSeq(allowed, ",") {
 			if strings.TrimSpace(candidate) == origin {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Add("Vary", "Origin")

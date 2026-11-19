@@ -33,7 +33,7 @@ func newPayloadReader(body io.ReadCloser, auth *Auth, trailerHeader string) io.R
 		chunkHash: sha256.New(),
 		trailers:  map[string]hash.Hash{},
 	}
-	for _, name := range strings.Split(trailerHeader, ",") {
+	for name := range strings.SplitSeq(trailerHeader, ",") {
 		name = strings.ToLower(strings.TrimSpace(name))
 		switch name {
 		case "x-amz-checksum-sha256":

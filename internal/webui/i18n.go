@@ -790,8 +790,7 @@ func (l *lang) errorText(err error) string {
 	if errors.Is(err, google.ErrReauth) {
 		return l.t("err.reauth")
 	}
-	var ae *google.APIError
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[*google.APIError](err); ok {
 		message := strings.ToLower(ae.Message)
 		switch {
 		case ae.Status == http.StatusUnauthorized:
@@ -811,8 +810,7 @@ func (l *lang) errorText(err error) string {
 			return l.t("err.internal")
 		}
 	}
-	var de *drive.Error
-	if errors.As(err, &de) {
+	if de, ok := errors.AsType[*drive.Error](err); ok {
 		switch de.Code {
 		case "AccessDenied":
 			msg := strings.ToLower(de.Message)

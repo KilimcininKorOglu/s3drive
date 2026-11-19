@@ -72,7 +72,7 @@ func (a *Authenticator) verifyHeader(r *http.Request, now time.Time) (*Auth, *Au
 		return nil, authErr("InvalidRequest", "unsupported authorization algorithm")
 	}
 	fields := map[string]string{}
-	for _, part := range strings.Split(strings.TrimPrefix(authz, "AWS4-HMAC-SHA256 "), ",") {
+	for part := range strings.SplitSeq(strings.TrimPrefix(authz, "AWS4-HMAC-SHA256 "), ",") {
 		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if ok {
 			fields[k] = v
@@ -264,7 +264,7 @@ func canonicalQuery(r *http.Request) string {
 	var pairs []kv
 	raw := r.URL.RawQuery
 	if raw != "" {
-		for _, part := range strings.Split(raw, "&") {
+		for part := range strings.SplitSeq(raw, "&") {
 			if part == "" {
 				continue
 			}
@@ -379,10 +379,7 @@ func SignQueryMethod(rawURL, accessKey, secret, region, method string, expires t
 	if !expires.After(now) {
 		return "", fmt.Errorf("presigned URL expiry must be in the future")
 	}
-	seconds := int64(expires.Sub(now).Seconds())
-	if seconds < 1 {
-		seconds = 1
-	}
+	seconds := max(int64(expires.Sub(now).Seconds()), 1)
 	if seconds > 604800 {
 		return "", fmt.Errorf("presigned URL expiry cannot exceed 7 days")
 	}

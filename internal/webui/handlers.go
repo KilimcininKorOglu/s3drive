@@ -155,10 +155,7 @@ func quota(used, limit int64) (int, string) {
 	if limit <= 0 {
 		return 0, ""
 	}
-	pct := int(used * 100 / limit)
-	if pct > 100 {
-		pct = 100
-	}
+	pct := min(int(used*100/limit), 100)
 	class := ""
 	if pct >= 90 {
 		class = "danger"
@@ -334,10 +331,10 @@ func (s *Server) buildFiles(r *http.Request, b baseData, bucket, prefix, afterTo
 	data.Crumbs = append(data.Crumbs, crumbView{Name: bucket, Prefix: ""})
 	if prefix != "" {
 		parts := strings.Split(strings.TrimSuffix(prefix, "/"), "/")
-		cumulative := ""
+		var cumulative strings.Builder
 		for i, part := range parts {
-			cumulative += part + "/"
-			data.Crumbs = append(data.Crumbs, crumbView{Name: part, Prefix: cumulative, Last: i == len(parts)-1})
+			cumulative.WriteString(part + "/")
+			data.Crumbs = append(data.Crumbs, crumbView{Name: part, Prefix: cumulative.String(), Last: i == len(parts)-1})
 		}
 	}
 	if len(data.Crumbs) == 1 {
@@ -1241,10 +1238,7 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 		s.setFlash(w, r, "error", l.errorText(err))
 	}
 	data := auditData{baseData: b, Total: total, Page: page, Filter: f, SinceText: sinceText, UntilText: untilText}
-	data.Pages = (total + f.Limit - 1) / f.Limit
-	if data.Pages < 1 {
-		data.Pages = 1
-	}
+	data.Pages = max((total+f.Limit-1)/f.Limit, 1)
 	data.PrevPage, data.NextPage = page-1, page+1
 	data.HasPrev, data.HasNext = page > 1, page < data.Pages
 	q := r.URL.Query()
@@ -1364,8 +1358,8 @@ func (s *Server) s3Endpoint(r *http.Request) string {
 	host, port, err := net.SplitHostPort(s.Cfg.S3Addr)
 	if err != nil {
 		host, port = "", "9000"
-		if strings.HasPrefix(s.Cfg.S3Addr, ":") {
-			port = strings.TrimPrefix(s.Cfg.S3Addr, ":")
+		if after, ok := strings.CutPrefix(s.Cfg.S3Addr, ":"); ok {
+			port = after
 		}
 	}
 	if host == "" || host == "0.0.0.0" || host == "::" {
