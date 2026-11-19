@@ -800,6 +800,12 @@ func setObjectHeaders(o *opCtx, obj *drive.ObjectReader) {
 
 // checkConditions implements the usual S3 conditional GET headers.
 func checkConditions(o *opCtx, obj *drive.ObjectReader) bool {
+	return failsETagCondition(o, obj) || failsDateCondition(o, obj)
+}
+
+// failsETagCondition evaluates If-Match and If-None-Match and writes the
+// 412/304 response when one decides the request.
+func failsETagCondition(o *opCtx, obj *drive.ObjectReader) bool {
 	h := o.r.Header
 	if v := h.Get("If-Match"); v != "" && v != "*" && !etagMatches(v, obj.Object.ETag) {
 		writeS3Error(o.w, o.r, o.reqID, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", http.StatusPreconditionFailed)
@@ -810,6 +816,12 @@ func checkConditions(o *opCtx, obj *drive.ObjectReader) bool {
 		o.w.WriteHeader(http.StatusNotModified)
 		return true
 	}
+	return false
+}
+
+// failsDateCondition evaluates If-Modified-Since and If-Unmodified-Since.
+func failsDateCondition(o *opCtx, obj *drive.ObjectReader) bool {
+	h := o.r.Header
 	if v := h.Get("If-Modified-Since"); v != "" {
 		if t, err := http.ParseTime(v); err == nil && !obj.Object.Modified.After(t) {
 			setObjectHeaders(o, obj)
@@ -847,30 +859,12 @@ func (s *Server) deleteObject(o *opCtx) {
 }
 
 func (s *Server) copyObject(o *opCtx) {
-	raw := o.r.Header.Get("x-amz-copy-source")
-	if i := strings.IndexByte(raw, '?'); i >= 0 {
-		raw = raw[:i]
-	}
-	decoded, err := url.PathUnescape(strings.TrimPrefix(raw, "/"))
-	if err != nil {
-		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid x-amz-copy-source", http.StatusBadRequest)
+	srcBucket, srcKey, ok := copySource(o)
+	if !ok {
 		return
 	}
-	srcBucket, srcKey := splitFirst(decoded)
-	if srcBucket == "" || srcKey == "" {
-		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid x-amz-copy-source", http.StatusBadRequest)
-		return
-	}
-	if o.keyPolicy != nil && !o.keyPolicy.CanRead(srcBucket, srcKey) {
-		writeS3Error(o.w, o.r, o.reqID, "AccessDenied", "access denied by key policy", http.StatusForbidden)
-		return
-	}
-	directive := strings.ToUpper(strings.TrimSpace(o.r.Header.Get("x-amz-metadata-directive")))
-	if directive == "" {
-		directive = "COPY"
-	}
-	if directive != "COPY" && directive != "REPLACE" {
-		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "x-amz-metadata-directive must be COPY or REPLACE", http.StatusBadRequest)
+	directive, ok := metadataDirective(o)
+	if !ok {
 		return
 	}
 	res, err := s.Svc.Copy(o.r.Context(), srcBucket, srcKey, o.bucket, o.key)
@@ -880,18 +874,9 @@ func (s *Server) copyObject(o *opCtx) {
 	}
 	meta := store.ObjectMeta{Bucket: o.bucket, Key: o.key, ETag: res.ETag}
 	if directive == "COPY" {
-		if src, err := s.Svc.ObjectMeta(o.r.Context(), srcBucket, srcKey); err == nil {
-			if src.ETag != "" {
-				meta.ETag = src.ETag
-				res.ETag = src.ETag
-			}
-			meta.ContentType = src.ContentType
-			meta.StorageClass = src.StorageClass
-			meta.Metadata = src.Metadata
-			meta.Checksum = src.Checksum
-		}
-	}
-	if directive == "REPLACE" {
+		s.copySourceMeta(o, srcBucket, srcKey, &meta)
+		res.ETag = meta.ETag
+	} else {
 		meta.ContentType = o.r.Header.Get("Content-Type")
 		meta.StorageClass = strings.ToUpper(strings.TrimSpace(o.r.Header.Get("x-amz-storage-class")))
 		meta.Metadata = userMetadataJSON(o.r)
@@ -907,44 +892,101 @@ func (s *Server) copyObject(o *opCtx) {
 	})
 }
 
+// copySource parses x-amz-copy-source and checks that the key policy may
+// read it. It writes the error response itself.
+func copySource(o *opCtx) (bucket, key string, ok bool) {
+	raw, _, _ := strings.Cut(o.r.Header.Get("x-amz-copy-source"), "?")
+	decoded, err := url.PathUnescape(strings.TrimPrefix(raw, "/"))
+	if err == nil {
+		bucket, key = splitFirst(decoded)
+	}
+	if bucket == "" || key == "" {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "invalid x-amz-copy-source", http.StatusBadRequest)
+		return "", "", false
+	}
+	if o.keyPolicy != nil && !o.keyPolicy.CanRead(bucket, key) {
+		writeS3Error(o.w, o.r, o.reqID, "AccessDenied", "access denied by key policy", http.StatusForbidden)
+		return "", "", false
+	}
+	return bucket, key, true
+}
+
+func metadataDirective(o *opCtx) (string, bool) {
+	directive := cmp.Or(strings.ToUpper(strings.TrimSpace(o.r.Header.Get("x-amz-metadata-directive"))), "COPY")
+	if directive != "COPY" && directive != "REPLACE" {
+		writeS3Error(o.w, o.r, o.reqID, "InvalidArgument", "x-amz-metadata-directive must be COPY or REPLACE", http.StatusBadRequest)
+		return "", false
+	}
+	return directive, true
+}
+
+// copySourceMeta carries the source's stored S3 semantics into meta for
+// x-amz-metadata-directive: COPY. A source without stored metadata keeps
+// the Drive-derived values.
+func (s *Server) copySourceMeta(o *opCtx, srcBucket, srcKey string, meta *store.ObjectMeta) {
+	src, err := s.Svc.ObjectMeta(o.r.Context(), srcBucket, srcKey)
+	if err != nil {
+		return
+	}
+	meta.ETag = cmp.Or(src.ETag, meta.ETag)
+	meta.ContentType = src.ContentType
+	meta.StorageClass = src.StorageClass
+	meta.Metadata = src.Metadata
+	meta.Checksum = src.Checksum
+}
+
 func (s *Server) deleteObjects(o *opCtx) {
+	req, ok := s.readDeleteRequest(o)
+	if !ok {
+		return
+	}
+	out := deleteResult{Xmlns: xmlNS}
+	for _, item := range req.Objects {
+		s.deleteListedObject(o, item.Key, req.Quiet, &out)
+	}
+	writeXML(o.w, http.StatusOK, out)
+}
+
+// readDeleteRequest reads and validates a DeleteObjects body (Content-MD5,
+// XML, at most 1000 keys). It writes the error response itself.
+func (s *Server) readDeleteRequest(o *opCtx) (deleteObjectsRequest, bool) {
+	var req deleteObjectsRequest
 	body, err := io.ReadAll(io.LimitReader(o.r.Body, 4<<20))
 	if err != nil {
 		s.fail(o, err)
-		return
+		return req, false
 	}
 	if v := o.r.Header.Get("Content-MD5"); v != "" {
 		raw, derr := base64.StdEncoding.DecodeString(v)
 		sum := md5.Sum(body) // #nosec G401 -- S3 DeleteObjects requires Content-MD5
 		if derr != nil || len(raw) != 16 || !bytes.Equal(raw, sum[:]) {
 			writeS3Error(o.w, o.r, o.reqID, "BadDigest", "the Content-MD5 you specified did not match what we received", http.StatusBadRequest)
-			return
+			return req, false
 		}
 	}
-	var req deleteObjectsRequest
 	if err := xml.Unmarshal(body, &req); err != nil {
 		writeS3Error(o.w, o.r, o.reqID, "MalformedXML", "the XML you provided was not well-formed", http.StatusBadRequest)
-		return
+		return req, false
 	}
 	if len(req.Objects) > 1000 {
 		writeS3Error(o.w, o.r, o.reqID, "InvalidRequest", "at most 1000 keys can be deleted per request", http.StatusBadRequest)
+		return req, false
+	}
+	return req, true
+}
+
+func (s *Server) deleteListedObject(o *opCtx, key string, quiet bool, out *deleteResult) {
+	if o.keyPolicy != nil && !o.keyPolicy.CanWrite(o.bucket, key) {
+		out.Errors = append(out.Errors, deleteErrItem{Key: key, Code: "AccessDenied", Message: "access denied by key policy"})
 		return
 	}
-	out := deleteResult{Xmlns: xmlNS}
-	for _, item := range req.Objects {
-		if o.keyPolicy != nil && !o.keyPolicy.CanWrite(o.bucket, item.Key) {
-			out.Errors = append(out.Errors, deleteErrItem{Key: item.Key, Code: "AccessDenied", Message: "access denied by key policy"})
-			continue
-		}
-		if err := s.Svc.Delete(o.r.Context(), o.bucket, item.Key); err != nil && !drive.IsNotFound(err) {
-			out.Errors = append(out.Errors, deleteErrItem{Key: item.Key, Code: drive.CodeOf(err), Message: err.Error()})
-			continue
-		}
-		if !req.Quiet {
-			out.Deleted = append(out.Deleted, deletedItem{Key: item.Key})
-		}
+	if err := s.Svc.Delete(o.r.Context(), o.bucket, key); err != nil && !drive.IsNotFound(err) {
+		out.Errors = append(out.Errors, deleteErrItem{Key: key, Code: drive.CodeOf(err), Message: err.Error()})
+		return
 	}
-	writeXML(o.w, http.StatusOK, out)
+	if !quiet {
+		out.Deleted = append(out.Deleted, deletedItem{Key: key})
+	}
 }
 
 // ---------------------------------------------------------------------------
